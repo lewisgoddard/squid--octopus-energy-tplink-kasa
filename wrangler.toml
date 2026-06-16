@@ -1,0 +1,11 @@
+name = "kraken"
+main = "index.js"
+compatibility_date = "2026-06-01"
+
+[triggers]
+crons = ["32 */4 * * *"]
+
+[[d1_databases]]
+binding = "DATABASE"
+database_name = "kraken-db"
+database_id = "36fdd91a-daca-48e9-ac7a-f4c98465cba1"

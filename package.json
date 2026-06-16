@@ -1,0 +1,17 @@
+{
+  "name": "octopus-energy-rates",
+  "version": "1.0.0",
+  "description": "A [Cloudflare Worker](https://workers.cloudflare.com/) that proxies and caches Octopus Energy API data, backed by a [Cloudflare D1](https://developers.cloudflare.com/d1/) database.",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "wrangler": "^4.100.0"
+  }
+}
