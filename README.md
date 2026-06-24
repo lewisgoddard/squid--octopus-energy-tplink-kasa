@@ -175,6 +175,7 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 | `PUT /api/kasa/devices` | Creates or updates a device control rule. Requires auth. See [Kasa device control](#kasa-device-control). |
 | `GET /api/kasa/devices/live` | Lists the devices on your TP-Link Kasa cloud account (with their `device_id`s), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). Requires auth. |
 | `GET /api/kasa/sync` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. Requires auth. |
+| `GET /api/kasa/forecast` | Read-only preview of which half-hour slots each enabled rule would switch its device **on**, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. Each result includes `on_slots`, `on_hours` and the qualifying `slots` (with prices). Requires auth. |
 | `GET /api/kasa/usage` | Reads energy data from a device's emeter. Requires auth. Query: `device` (device_id or alias, required), `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
 | `GET /api/kasa/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). Requires auth. |
 
@@ -274,6 +275,13 @@ strategies are supported:
    also trigger it manually:
    ```bash
    curl -H "Authorization: Bearer $OCTOPUS_API_KEY" https://<worker>/api/kasa/sync
+   ```
+4. Preview which slots each rule will switch on (read-only, from cached rates):
+   ```bash
+   curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
+     https://<worker>/api/kasa/forecast            # today + tomorrow (UTC)
+   curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
+     "https://<worker>/api/kasa/forecast?date=2026-06-25"   # a single day
    ```
 
 A device's relay state is read before each switch, so the worker only sends a

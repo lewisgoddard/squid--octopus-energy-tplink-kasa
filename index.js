@@ -467,6 +467,48 @@ export default {
         return Response.json({ results: await evaluateDevices(env) })
       }
 
+      if (pathname === "/api/kasa/forecast" && request.method === "GET") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        // Read-only preview of which slots each enabled rule would switch the device
+        // on, from cached rates only. No Kasa calls and no switching.
+        const today = new Date().toISOString().slice(0, 10)
+        const param = searchParams.get("date")
+        const days = param ? [param] : [today, new Date(Date.now() + 86400000).toISOString().slice(0, 10)]
+        /** @type {{ results: any[] }} */
+        const { results: rules } = await env.DATABASE.prepare(
+          "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
+        ).bind(env.USER_ID).all()
+        const results = []
+        for (const rule of rules) {
+          const slots = []
+          for (const day of days) {
+            /** @type {{ results: { time_start: string, time_end: string, price: string }[] }} */
+            const { results: dayRates } = await env.DATABASE.prepare(
+              "SELECT time_start, time_end, price FROM rates WHERE user_id = ? AND time_start >= ? AND time_start < ? ORDER BY time_start ASC"
+            ).bind(env.USER_ID, `${day}T00:00:00Z`, `${day}T24:00:00Z`).all()
+            let qualifies
+            if (rule.strategy === "cheapest_hours") {
+              const set = await cheapestStarts(env, day, Math.max(1, Math.round(rule.hours * 2)))
+              qualifies = (/** @type {{ time_start: string }} */ r) => set.has(r.time_start)
+            } else {
+              qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= rule.threshold_p
+            }
+            for (const r of dayRates) if (qualifies(r)) slots.push(r)
+          }
+          results.push({
+            device_id: rule.device_id,
+            alias: rule.alias,
+            strategy: rule.strategy,
+            threshold_p: rule.threshold_p,
+            hours: rule.hours,
+            on_slots: slots.length,
+            on_hours: slots.length / 2,
+            slots,
+          })
+        }
+        return Response.json({ days, results })
+      }
+
       if (pathname === "/api/kasa/log" && request.method === "GET") {
         if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
         const limit = Math.min(parseInt(searchParams.get("limit") || "50", 10), 200)
