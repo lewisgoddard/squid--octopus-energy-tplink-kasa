@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.js", "worker-configuration.d.ts"]
+  "include": ["index.js", "worker-configuration.d.ts", "worker-env.d.ts"]
 }
