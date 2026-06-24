@@ -1,3 +1,18 @@
+/**
+ * A device as returned by the TP-Link Kasa cloud `getDeviceList` call.
+ * @typedef {Object} KasaDevice
+ * @property {string} deviceId
+ * @property {string} [alias]
+ * @property {string} appServerUrl
+ * @property {string} [deviceModel]
+ * @property {number} status - 1 when the device is online.
+ */
+
+/**
+ * @param {string} url
+ * @param {Env} env
+ * @returns {Promise<Response>}
+ */
 async function octopusFetch(url, env) {
   return fetch(url, {
     headers: {
@@ -7,20 +22,22 @@ async function octopusFetch(url, env) {
   })
 }
 
+/** @param {Env} env */
 async function syncTariff(env) {
   const response = await octopusFetch(
     `https://api.octopus.energy/v1/accounts/${env.OCTOPUS_ACCOUNT}/`,
     env
   )
   if (!response.ok) throw new Error(`Account lookup failed: ${response.status} ${await response.text()}`)
+  /** @type {any} */
   const account = await response.json()
   const now = new Date().toISOString()
   const meterPoint = account.properties
-    ?.flatMap(p => p.electricity_meter_points || [])
-    .find(mp => mp.mpan === env.ELECTRICITY_MPAN)
+    ?.flatMap((/** @type {any} */ p) => p.electricity_meter_points || [])
+    .find((/** @type {any} */ mp) => mp.mpan === env.ELECTRICITY_MPAN)
   if (!meterPoint) throw new Error(`MPAN ${env.ELECTRICITY_MPAN} not found in account ${env.OCTOPUS_ACCOUNT}`)
   const agreement = meterPoint.agreements?.find(
-    a => a.valid_from <= now && (!a.valid_to || a.valid_to > now)
+    (/** @type {any} */ a) => a.valid_from <= now && (!a.valid_to || a.valid_to > now)
   )
   if (!agreement) throw new Error(`No active agreement found for MPAN ${env.ELECTRICITY_MPAN}`)
   await env.DATABASE.prepare(
@@ -29,7 +46,9 @@ async function syncTariff(env) {
   return agreement.tariff_code
 }
 
+/** @param {Env} env */
 async function fetchOctopusRates(env) {
+  /** @type {{ tariff_code: string } | null} */
   const row = await env.DATABASE.prepare(
     "SELECT tariff_code FROM tariffs WHERE user_id = ?"
   ).bind(env.USER_ID).first()
@@ -39,11 +58,19 @@ async function fetchOctopusRates(env) {
   const ratesURL = `https://api.octopus.energy/v1/products/${productCode}/electricity-tariffs/${row.tariff_code}/standard-unit-rates/?page_size=96`
   const response = await octopusFetch(ratesURL, env)
   if (!response.ok) throw new Error(`Rates fetch failed: ${response.status} ${await response.text()}`)
-  return response.json()
+  /** @type {Promise<any>} */
+  const json = response.json()
+  return json
 }
 
+/**
+ * @param {string} url
+ * @param {Env} env
+ * @param {string} selfURL
+ */
 async function fetchOctopusMeter(url, env, selfURL) {
   const response = await octopusFetch(url, env)
+  /** @type {any} */
   const data = await response.json()
   const base = new URL(selfURL)
   const next = data.next
@@ -55,6 +82,7 @@ async function fetchOctopusMeter(url, env, selfURL) {
   return Response.json({ count: data.count, next, previous, results: data.results })
 }
 
+/** @param {Env} env */
 async function updateRates(env) {
   await syncTariff(env)
   const { results } = await fetchOctopusRates(env)
@@ -68,12 +96,21 @@ async function updateRates(env) {
   return results
 }
 
+/**
+ * @param {Request} request
+ * @param {Env} env
+ */
 function authorized(request, env) {
   return request.headers.get("Authorization") === `Bearer ${env.OCTOPUS_API_KEY}`
 }
 
 // --- TP-Link Kasa cloud control ---------------------------------------------
 
+/**
+ * @param {string} url
+ * @param {any} body
+ * @returns {Promise<any>}
+ */
 async function tplinkPost(url, body) {
   const response = await fetch(url, {
     method: "POST",
@@ -84,8 +121,14 @@ async function tplinkPost(url, body) {
   return response.json()
 }
 
+/**
+ * @param {Env} env
+ * @param {boolean} forceNew
+ * @returns {Promise<string>}
+ */
 async function tplinkToken(env, forceNew) {
   if (!forceNew) {
+    /** @type {{ token: string } | null} */
     const row = await env.DATABASE.prepare(
       "SELECT token FROM tplink_tokens WHERE user_id = ?"
     ).bind(env.USER_ID).first()
@@ -107,7 +150,13 @@ async function tplinkToken(env, forceNew) {
   return data.result.token
 }
 
-// Calls the cloud with the cached token, re-logging in once if it has expired.
+/**
+ * Calls the cloud with the cached token, re-logging in once if it has expired.
+ * @param {Env} env
+ * @param {(token: string) => string} makeUrl
+ * @param {any} body
+ * @returns {Promise<any>}
+ */
 async function tplinkCall(env, makeUrl, body) {
   let data = await tplinkPost(makeUrl(await tplinkToken(env, false)), body)
   if (data.error_code !== 0) {
@@ -117,11 +166,21 @@ async function tplinkCall(env, makeUrl, body) {
   return data.result
 }
 
+/**
+ * @param {Env} env
+ * @returns {Promise<KasaDevice[]>}
+ */
 async function kasaDeviceList(env) {
   const result = await tplinkCall(env, token => `https://wap.tplinkcloud.com/?token=${token}`, { method: "getDeviceList" })
   return result.deviceList || []
 }
 
+/**
+ * @param {Env} env
+ * @param {KasaDevice} dev
+ * @param {any} command
+ * @returns {Promise<any>}
+ */
 async function kasaPassthrough(env, dev, command) {
   const result = await tplinkCall(
     env,
@@ -131,23 +190,46 @@ async function kasaPassthrough(env, dev, command) {
   return JSON.parse(result.responseData)
 }
 
+/**
+ * @param {Env} env
+ * @param {KasaDevice} dev
+ * @returns {Promise<number>} 0 (off) or 1 (on)
+ */
 async function kasaReadState(env, dev) {
   const data = await kasaPassthrough(env, dev, { system: { get_sysinfo: {} } })
   return data.system.get_sysinfo.relay_state // 0 (off) or 1 (on)
 }
 
+/**
+ * @param {Env} env
+ * @param {KasaDevice} dev
+ * @param {boolean} on
+ */
 async function kasaSetState(env, dev, on) {
   await kasaPassthrough(env, dev, { system: { set_relay_state: { state: on ? 1 : 0 } } })
 }
 
-// Resolves a live device by its deviceId or (case-insensitive) alias.
+/**
+ * Resolves a live device by its deviceId or (case-insensitive) alias.
+ * @param {Env} env
+ * @param {string} identifier
+ * @returns {Promise<KasaDevice | null>}
+ */
 async function findKasaDevice(env, identifier) {
   const devices = await kasaDeviceList(env)
   const id = identifier.toLowerCase()
   return devices.find(d => d.deviceId === identifier || (d.alias || "").toLowerCase() === id) || null
 }
 
-// Reads energy data from a device's emeter. kind: 'realtime' | 'day' | 'month'.
+/**
+ * Reads energy data from a device's emeter.
+ * @param {Env} env
+ * @param {KasaDevice} dev
+ * @param {"realtime" | "day" | "month"} kind
+ * @param {number} year
+ * @param {number} month
+ * @returns {Promise<any>}
+ */
 async function kasaUsage(env, dev, kind, year, month) {
   if (kind === "day") {
     const data = await kasaPassthrough(env, dev, { emeter: { get_daystat: { year, month } } })
@@ -163,22 +245,38 @@ async function kasaUsage(env, dev, kind, year, month) {
 
 // --- Rate lookups used by the controller ------------------------------------
 
+/**
+ * @param {Env} env
+ * @param {string} atISO
+ * @returns {Promise<{ time_start: string, time_end: string, price: string } | null>}
+ */
 async function currentRate(env, atISO) {
   return env.DATABASE.prepare(
     "SELECT time_start, time_end, price FROM rates WHERE user_id = ? AND time_start <= ? AND time_end > ? ORDER BY time_start DESC LIMIT 1"
   ).bind(env.USER_ID, atISO, atISO).first()
 }
 
-// Set of time_start values for the cheapest `count` half-hour periods of the given UTC day.
+/**
+ * Set of time_start values for the cheapest `count` half-hour periods of the given UTC day.
+ * @param {Env} env
+ * @param {string} dayPrefix
+ * @param {number} count
+ * @returns {Promise<Set<string>>}
+ */
 async function cheapestStarts(env, dayPrefix, count) {
   const { results } = await env.DATABASE.prepare(
     "SELECT time_start FROM rates WHERE user_id = ? AND time_start >= ? AND time_start < ? ORDER BY CAST(price AS REAL) ASC, time_start ASC LIMIT ?"
   ).bind(env.USER_ID, `${dayPrefix}T00:00:00Z`, `${dayPrefix}T24:00:00Z`, count).all()
-  return new Set(results.map(r => r.time_start))
+  const rows = /** @type {{ time_start: string }[]} */ (results)
+  return new Set(rows.map(r => r.time_start))
 }
 
-// Evaluates every enabled device rule against the current rate and switches as needed.
+/**
+ * Evaluates every enabled device rule against the current rate and switches as needed.
+ * @param {Env} env
+ */
 async function evaluateDevices(env) {
+  /** @type {{ results: any[] }} */
   const { results: rules } = await env.DATABASE.prepare(
     "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
   ).bind(env.USER_ID).all()
@@ -220,6 +318,7 @@ async function evaluateDevices(env) {
   return actions
 }
 
+/** @type {ExportedHandler<Env>} */
 export default {
   async scheduled(event, env, ctx) {
     if (event.cron === "0,30 * * * *") {
@@ -278,11 +377,13 @@ export default {
         const filterBindings = [env.USER_ID]
         if (from) { where += " AND time_start >= ?"; filterBindings.push(from) }
         if (to)   { where += " AND time_start <= ?"; filterBindings.push(to) }
-        const [{ count }, { results }] = await Promise.all([
+        const [countRow, { results }] = await Promise.all([
           env.DATABASE.prepare(`SELECT COUNT(*) as count FROM rates ${where}`).bind(...filterBindings).first(),
           env.DATABASE.prepare(`SELECT time_start, time_end, price FROM rates ${where} ORDER BY time_start DESC LIMIT ? OFFSET ?`).bind(...filterBindings, limit, offset).all()
         ])
-        const pageURL = (p) => { const u = new URL(request.url); u.searchParams.set("page", p); u.searchParams.set("limit", limit); return u.toString() }
+        const count = /** @type {number} */ (countRow?.count ?? 0)
+        /** @param {number} p */
+        const pageURL = (p) => { const u = new URL(request.url); u.searchParams.set("page", String(p)); u.searchParams.set("limit", String(limit)); return u.toString() }
         return Response.json({
           count,
           next: offset + limit < count ? pageURL(page + 1) : null,
@@ -294,6 +395,7 @@ export default {
       if ( pathname == "/api/octopus/rates/live" ) {
         const data = await fetchOctopusRates(env)
         const base = new URL(request.url)
+        /** @param {string} u */
         const rewrite = u => { const r = new URL(base); new URL(u).searchParams.forEach((v, k) => r.searchParams.set(k, v)); return r.toString() }
         return Response.json({
           count: data.count,
@@ -372,13 +474,13 @@ export default {
         if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
         const identifier = searchParams.get("device")
         if (!identifier) return new Response("Missing device", { status: 400 })
-        const kind = searchParams.get("kind") || "realtime"
+        const kind = /** @type {"realtime" | "day" | "month"} */ (searchParams.get("kind") || "realtime")
         if (!["realtime", "day", "month"].includes(kind)) {
           return new Response("kind must be 'realtime', 'day' or 'month'", { status: 400 })
         }
         const now = new Date()
-        const year = parseInt(searchParams.get("year") || now.getUTCFullYear(), 10)
-        const month = parseInt(searchParams.get("month") || (now.getUTCMonth() + 1), 10)
+        const year = parseInt(searchParams.get("year") || String(now.getUTCFullYear()), 10)
+        const month = parseInt(searchParams.get("month") || String(now.getUTCMonth() + 1), 10)
         const dev = await findKasaDevice(env, identifier)
         if (!dev) return new Response("Not Found", { status: 404 })
         if (dev.status !== 1) return new Response("Device offline", { status: 409 })
