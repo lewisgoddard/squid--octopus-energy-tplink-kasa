@@ -3,7 +3,9 @@ main = "index.js"
 compatibility_date = "2026-06-01"
 
 [triggers]
-crons = ["32 */4 * * *"]
+# 32 */4 * * *  -> refresh Octopus rates (every 4 hours)
+# 0,30 * * * *  -> evaluate Kasa devices against the current rate (every half hour)
+crons = ["32 */4 * * *", "0,30 * * * *"]
 
 [[d1_databases]]
 binding = "DATABASE"

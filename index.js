@@ -68,9 +68,144 @@ async function updateRates(env) {
   return results
 }
 
+function authorized(request, env) {
+  return request.headers.get("Authorization") === `Bearer ${env.OCTOPUS_API_KEY}`
+}
+
+// --- TP-Link Kasa cloud control ---------------------------------------------
+
+async function tplinkPost(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) throw new Error(`TP-Link HTTP ${response.status}: ${await response.text()}`)
+  return response.json()
+}
+
+async function tplinkToken(env, forceNew) {
+  if (!forceNew) {
+    const row = await env.DATABASE.prepare(
+      "SELECT token FROM tplink_tokens WHERE user_id = ?"
+    ).bind(env.USER_ID).first()
+    if (row) return row.token
+  }
+  const data = await tplinkPost("https://wap.tplinkcloud.com", {
+    method: "login",
+    params: {
+      appType: "Kasa_Android",
+      cloudUserName: env.TPLINK_USERNAME,
+      cloudPassword: env.TPLINK_PASSWORD,
+      terminalUUID: crypto.randomUUID(),
+    },
+  })
+  if (data.error_code !== 0) throw new Error(`TP-Link login failed: ${data.error_code} ${data.msg || ""}`)
+  await env.DATABASE.prepare(
+    "INSERT INTO tplink_tokens (user_id, token, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET token = excluded.token, updated_at = excluded.updated_at"
+  ).bind(env.USER_ID, data.result.token, new Date().toISOString()).run()
+  return data.result.token
+}
+
+// Calls the cloud with the cached token, re-logging in once if it has expired.
+async function tplinkCall(env, makeUrl, body) {
+  let data = await tplinkPost(makeUrl(await tplinkToken(env, false)), body)
+  if (data.error_code !== 0) {
+    data = await tplinkPost(makeUrl(await tplinkToken(env, true)), body)
+  }
+  if (data.error_code !== 0) throw new Error(`TP-Link error ${data.error_code}: ${data.msg || JSON.stringify(data)}`)
+  return data.result
+}
+
+async function kasaDeviceList(env) {
+  const result = await tplinkCall(env, token => `https://wap.tplinkcloud.com/?token=${token}`, { method: "getDeviceList" })
+  return result.deviceList || []
+}
+
+async function kasaPassthrough(env, dev, command) {
+  const result = await tplinkCall(
+    env,
+    token => `${dev.appServerUrl}/?token=${token}`,
+    { method: "passthrough", params: { deviceId: dev.deviceId, requestData: JSON.stringify(command) } }
+  )
+  return JSON.parse(result.responseData)
+}
+
+async function kasaReadState(env, dev) {
+  const data = await kasaPassthrough(env, dev, { system: { get_sysinfo: {} } })
+  return data.system.get_sysinfo.relay_state // 0 (off) or 1 (on)
+}
+
+async function kasaSetState(env, dev, on) {
+  await kasaPassthrough(env, dev, { system: { set_relay_state: { state: on ? 1 : 0 } } })
+}
+
+// --- Rate lookups used by the controller ------------------------------------
+
+async function currentRate(env, atISO) {
+  return env.DATABASE.prepare(
+    "SELECT time_start, time_end, price FROM rates WHERE user_id = ? AND time_start <= ? AND time_end > ? ORDER BY time_start DESC LIMIT 1"
+  ).bind(env.USER_ID, atISO, atISO).first()
+}
+
+// Set of time_start values for the cheapest `count` half-hour periods of the given UTC day.
+async function cheapestStarts(env, dayPrefix, count) {
+  const { results } = await env.DATABASE.prepare(
+    "SELECT time_start FROM rates WHERE user_id = ? AND time_start >= ? AND time_start < ? ORDER BY CAST(price AS REAL) ASC, time_start ASC LIMIT ?"
+  ).bind(env.USER_ID, `${dayPrefix}T00:00:00Z`, `${dayPrefix}T24:00:00Z`, count).all()
+  return new Set(results.map(r => r.time_start))
+}
+
+// Evaluates every enabled device rule against the current rate and switches as needed.
+async function evaluateDevices(env) {
+  const { results: rules } = await env.DATABASE.prepare(
+    "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
+  ).bind(env.USER_ID).all()
+  if (!rules.length) return []
+
+  const nowISO = new Date().toISOString()
+  const rate = await currentRate(env, nowISO)
+  const liveDevices = await kasaDeviceList(env)
+  const byId = new Map(liveDevices.map(d => [d.deviceId, d]))
+
+  const actions = []
+  for (const rule of rules) {
+    const dev = byId.get(rule.device_id)
+    if (!dev) { actions.push({ device_id: rule.device_id, skipped: "not found" }); continue }
+    if (dev.status !== 1) { actions.push({ device_id: rule.device_id, alias: dev.alias, skipped: "offline" }); continue }
+    if (!rate) { actions.push({ device_id: rule.device_id, alias: dev.alias, skipped: "no rate data" }); continue }
+
+    const price = parseFloat(rate.price)
+    let desired, reason
+    if (rule.strategy === "cheapest_hours") {
+      const set = await cheapestStarts(env, nowISO.slice(0, 10), Math.max(1, Math.round(rule.hours * 2)))
+      desired = set.has(rate.time_start)
+      reason = `cheapest ${rule.hours}h${desired ? "" : " (not now)"}`
+    } else { // threshold
+      desired = price <= rule.threshold_p
+      reason = `${price}p ${desired ? "<=" : ">"} ${rule.threshold_p}p`
+    }
+
+    if ((await kasaReadState(env, dev) === 1) !== desired) {
+      await kasaSetState(env, dev, desired)
+      await env.DATABASE.prepare(
+        "INSERT INTO device_log (device_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?)"
+      ).bind(rule.device_id, nowISO, desired ? "on" : "off", price, reason).run()
+      actions.push({ device_id: rule.device_id, alias: dev.alias, action: desired ? "on" : "off", reason })
+    } else {
+      actions.push({ device_id: rule.device_id, alias: dev.alias, action: "unchanged", reason })
+    }
+  }
+  return actions
+}
+
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(updateRates(env).catch(err => console.error("Scheduled updateRates failed:", err)));
+    if (event.cron === "0,30 * * * *") {
+      ctx.waitUntil(evaluateDevices(env).catch(err => console.error("Scheduled evaluateDevices failed:", err)));
+    } else {
+      ctx.waitUntil(updateRates(env).catch(err => console.error("Scheduled updateRates failed:", err)));
+    }
   },
 
   async fetch(request, env, ctx) {
@@ -155,6 +290,61 @@ export default {
       if ( pathname == "/api/octopus/meters/gas" ) {
         const url = `https://api.octopus.energy/v1/gas-meter-points/${env.GAS_MPRN}/meters/${env.GAS_SERIAL}/consumption/`
         return fetchOctopusMeter(url, env, request.url)
+      }
+
+      if (pathname === "/api/kasa/devices" && request.method === "GET") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        const { results } = await env.DATABASE.prepare(
+          "SELECT device_id, alias, strategy, threshold_p, hours, enabled FROM devices WHERE user_id = ?"
+        ).bind(env.USER_ID).all()
+        return Response.json({ results })
+      }
+
+      if (pathname === "/api/kasa/devices" && request.method === "PUT") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        const body = await request.json()
+        if (!body.device_id) return new Response("Missing device_id", { status: 400 })
+        if (!["threshold", "cheapest_hours"].includes(body.strategy)) {
+          return new Response("strategy must be 'threshold' or 'cheapest_hours'", { status: 400 })
+        }
+        if (body.strategy === "threshold" && body.threshold_p == null) return new Response("Missing threshold_p", { status: 400 })
+        if (body.strategy === "cheapest_hours" && body.hours == null) return new Response("Missing hours", { status: 400 })
+        await env.DATABASE.prepare(
+          `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, enabled)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(device_id) DO UPDATE SET
+             alias = excluded.alias, strategy = excluded.strategy,
+             threshold_p = excluded.threshold_p, hours = excluded.hours, enabled = excluded.enabled`
+        ).bind(
+          body.device_id, env.USER_ID, body.alias ?? null, body.strategy,
+          body.threshold_p ?? null, body.hours ?? null, body.enabled === false ? 0 : 1
+        ).run()
+        return Response.json({ ...body, user_id: env.USER_ID })
+      }
+
+      if (pathname === "/api/kasa/devices/live" && request.method === "GET") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        const devices = await kasaDeviceList(env)
+        return Response.json({
+          results: devices.map(d => ({ device_id: d.deviceId, alias: d.alias, model: d.deviceModel, status: d.status }))
+        })
+      }
+
+      if (pathname === "/api/kasa/sync" && request.method === "GET") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        return Response.json({ results: await evaluateDevices(env) })
+      }
+
+      if (pathname === "/api/kasa/log" && request.method === "GET") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        const limit = Math.min(parseInt(searchParams.get("limit") || "50", 10), 200)
+        const { results } = await env.DATABASE.prepare(
+          `SELECT d.device_id, dev.alias, d.ts, d.action, d.price, d.reason
+           FROM device_log d LEFT JOIN devices dev ON dev.device_id = d.device_id
+           WHERE dev.user_id = ? OR dev.user_id IS NULL
+           ORDER BY d.ts DESC LIMIT ?`
+        ).bind(env.USER_ID, limit).all()
+        return Response.json({ results })
       }
 
       return new Response("Hi! Read /api/octopus/rates/cache for the todays rates.");
