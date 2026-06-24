@@ -140,6 +140,27 @@ async function kasaSetState(env, dev, on) {
   await kasaPassthrough(env, dev, { system: { set_relay_state: { state: on ? 1 : 0 } } })
 }
 
+// Resolves a live device by its deviceId or (case-insensitive) alias.
+async function findKasaDevice(env, identifier) {
+  const devices = await kasaDeviceList(env)
+  const id = identifier.toLowerCase()
+  return devices.find(d => d.deviceId === identifier || (d.alias || "").toLowerCase() === id) || null
+}
+
+// Reads energy data from a device's emeter. kind: 'realtime' | 'day' | 'month'.
+async function kasaUsage(env, dev, kind, year, month) {
+  if (kind === "day") {
+    const data = await kasaPassthrough(env, dev, { emeter: { get_daystat: { year, month } } })
+    return data.emeter.get_daystat.day_list
+  }
+  if (kind === "month") {
+    const data = await kasaPassthrough(env, dev, { emeter: { get_monthstat: { year } } })
+    return data.emeter.get_monthstat.month_list
+  }
+  const data = await kasaPassthrough(env, dev, { emeter: { get_realtime: {} } })
+  return data.emeter.get_realtime
+}
+
 // --- Rate lookups used by the controller ------------------------------------
 
 async function currentRate(env, atISO) {
@@ -345,6 +366,29 @@ export default {
            ORDER BY d.ts DESC LIMIT ?`
         ).bind(env.USER_ID, limit).all()
         return Response.json({ results })
+      }
+
+      if (pathname === "/api/kasa/usage" && request.method === "GET") {
+        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
+        const identifier = searchParams.get("device")
+        if (!identifier) return new Response("Missing device", { status: 400 })
+        const kind = searchParams.get("kind") || "realtime"
+        if (!["realtime", "day", "month"].includes(kind)) {
+          return new Response("kind must be 'realtime', 'day' or 'month'", { status: 400 })
+        }
+        const now = new Date()
+        const year = parseInt(searchParams.get("year") || now.getUTCFullYear(), 10)
+        const month = parseInt(searchParams.get("month") || (now.getUTCMonth() + 1), 10)
+        const dev = await findKasaDevice(env, identifier)
+        if (!dev) return new Response("Not Found", { status: 404 })
+        if (dev.status !== 1) return new Response("Device offline", { status: 409 })
+        return Response.json({
+          device_id: dev.deviceId,
+          alias: dev.alias,
+          kind,
+          ...(kind === "day" ? { year, month } : kind === "month" ? { year } : {}),
+          results: await kasaUsage(env, dev, kind, year, month),
+        })
       }
 
       return new Response("Hi! Read /api/octopus/rates/cache for the todays rates.");

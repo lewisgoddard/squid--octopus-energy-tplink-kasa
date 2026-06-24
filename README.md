@@ -175,6 +175,7 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 | `PUT /api/kasa/devices` | Creates or updates a device control rule. Requires auth. See [Kasa device control](#kasa-device-control). |
 | `GET /api/kasa/devices/live` | Lists the devices on your TP-Link Kasa cloud account (with their `device_id`s). Requires auth. |
 | `GET /api/kasa/sync` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. Requires auth. |
+| `GET /api/kasa/usage` | Reads energy data from a device's emeter. Requires auth. Query: `device` (device_id or alias, required), `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
 | `GET /api/kasa/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). Requires auth. |
 
 All `/api/kasa/*` endpoints require `Authorization: Bearer <OCTOPUS_API_KEY>`.
@@ -276,4 +277,23 @@ strategies are supported:
 A device's relay state is read before each switch, so the worker only sends a
 command (and writes a `device_log` row) when the state actually needs to change.
 Set `"enabled": false` on a rule to leave a device alone without deleting it.
+
+#### Energy monitoring
+
+For devices with energy monitoring (an emeter), `/api/kasa/usage` reads
+consumption directly from the plug. `device` accepts a `device_id` or an alias:
+
+```bash
+# Live readings (voltage / current / power / total)
+curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
+  "https://<worker>/api/kasa/usage?device=Dehumidifier"
+
+# Per-day totals for a given month
+curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
+  "https://<worker>/api/kasa/usage?device=Dehumidifier&kind=day&year=2026&month=6"
+
+# Per-month totals for a given year
+curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
+  "https://<worker>/api/kasa/usage?device=Dehumidifier&kind=month&year=2026"
+```
 
