@@ -55,10 +55,19 @@ Update `wrangler.toml` with your D1 `database_id`:
 3. Create the tables:
    ```bash
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text)"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [devices] (device_id text PRIMARY KEY, user_id text, alias text, strategy text, threshold_p real, hours real, enabled integer DEFAULT 1)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [devices] (device_id text PRIMARY KEY, user_id text, alias text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, ts text, action text, price real, reason text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
+   ```
+
+   Upgrading an existing database (adds the columns/table backing the `cheaper_than_gas` strategy):
+   ```bash
+   npx wrangler d1 execute kraken-db --remote --command "ALTER TABLE [devices] ADD COLUMN efficiency real DEFAULT 1"
+   npx wrangler d1 execute kraken-db --remote --command "ALTER TABLE [tariffs] ADD COLUMN gas_tariff_code text"
+   npx wrangler d1 execute kraken-db --remote --command "ALTER TABLE [tariffs] ADD COLUMN gas_price_p real"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    ```
 
 If you prefer to create the table in console, then use the following command:
@@ -72,18 +81,30 @@ CREATE TABLE IF NOT EXISTS [rates] (
   "price"        text
 );
 
+-- gas_rates mirrors rates and backs the 'cheaper_than_gas' strategy.
+CREATE TABLE IF NOT EXISTS [gas_rates] (
+  "noduplicates" text PRIMARY KEY,
+  "user_id"      text,
+  "time_start"   text,
+  "time_end"     text,
+  "price"        text
+);
+
 CREATE TABLE IF NOT EXISTS [tariffs] (
     user_id text PRIMARY KEY,
-    tariff_code text
+    tariff_code text,
+    gas_tariff_code text,          -- auto-discovered gas tariff (for 'cheaper_than_gas')
+    gas_price_p real               -- manual gas unit-rate override (pence/kWh); NULL = use fetched gas rate
 );
 
 CREATE TABLE IF NOT EXISTS [devices] (
     device_id   text PRIMARY KEY,  -- TP-Link cloud deviceId
     user_id     text,
     alias       text,
-    strategy    text,              -- 'threshold' | 'cheapest_hours'
+    strategy    text,              -- 'threshold' | 'cheapest_hours' | 'cheaper_than_gas'
     threshold_p real,              -- for 'threshold': switch on at/below this price (pence)
     hours       real,              -- for 'cheapest_hours': keep on during the cheapest N hours of the day
+    efficiency  real DEFAULT 1,    -- for 'cheaper_than_gas': on when elec price <= gas price x efficiency
     enabled     integer DEFAULT 1
 );
 
@@ -140,8 +161,9 @@ Create the table in the local D1 database (stored in `.wrangler/`):
 
 ```bash
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
-npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text)"
-npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [devices] (device_id text PRIMARY KEY, user_id text, alias text, strategy text, threshold_p real, hours real, enabled integer DEFAULT 1)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [devices] (device_id text PRIMARY KEY, user_id text, alias text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, ts text, action text, price real, reason text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
 ```
@@ -169,8 +191,8 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 | `GET /api/octopus/rates/live` | Fetches and returns the current unit rates directly from the Octopus Energy API without reading from or writing to the database. |
 | `GET /api/octopus/meters/electricity` | Fetches consumption data for the configured electricity meter point from the Octopus Energy API. |
 | `GET /api/octopus/meters/gas` | Fetches consumption data for the configured gas meter point from the Octopus Energy API. |
-| `GET /api/octopus/tariff` | Returns the currently configured tariff code for the user. Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. |
-| `PUT /api/octopus/tariff` | Sets or updates the tariff code for the user. Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}`. |
+| `GET /api/octopus/tariff` | Returns the configured tariff for the user: `tariff_code`, the auto-discovered `gas_tariff_code`, and the `gas_price_p` override (if any). Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. |
+| `PUT /api/octopus/tariff` | Sets the electricity tariff and/or the gas price override. Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}` and/or `{"gas_price_p": 6.5}` (pass `gas_price_p: null` to clear the override and fall back to the auto-fetched gas rate). |
 | `GET /api/kasa/devices` | Lists the configured device control rules from D1. Requires auth. |
 | `PUT /api/kasa/devices` | Creates or updates a device control rule. Requires auth. See [Kasa device control](#kasa-device-control). |
 | `GET /api/kasa/devices/live` | Lists the devices on your TP-Link Kasa cloud account (with their `device_id`s), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). Requires auth. |
@@ -242,13 +264,14 @@ Octopus rates, turning dumb devices into rate-aware ones. It talks to the
 TP-Link **cloud** API (the same path the Kasa app uses), so no local network
 access to the plugs is required.
 
-Each device is controlled by a rule stored in the `devices` table. Two
+Each device is controlled by a rule stored in the `devices` table. Three
 strategies are supported:
 
 | Strategy | Fields | Behaviour |
 |----------|--------|-----------|
 | `threshold` | `threshold_p` | On when the current half-hourly price is at or below `threshold_p` pence, off otherwise. |
 | `cheapest_hours` | `hours` | On during the cheapest `hours` hours of the current (UTC) day, off otherwise. Good for charging-type loads. |
+| `cheaper_than_gas` | `efficiency` | On when the current electricity price is at or below `gas_price × efficiency` pence, off otherwise. `efficiency` (default `1`) is the device's output-per-unit advantage over gas — e.g. `~3.3` for a heat pump (COP 3) vs a 90% boiler, `~1.1` for a resistive heater. The gas price is the `gas_price_p` override if set, else the gas unit rate auto-fetched from your Octopus gas tariff. |
 
 #### Setup
 
@@ -270,7 +293,15 @@ strategies are supported:
    curl -X PUT -H "Authorization: Bearer $OCTOPUS_API_KEY" \
      -d '{"device_id":"81...","alias":"Battery","strategy":"cheapest_hours","hours":4}' \
      https://<worker>/api/kasa/devices
+
+   # Run a heat pump (COP 3 vs a 90% boiler) only when electricity beats gas
+   curl -X PUT -H "Authorization: Bearer $OCTOPUS_API_KEY" \
+     -d '{"device_id":"82...","alias":"Heat pump","strategy":"cheaper_than_gas","efficiency":3.3}' \
+     https://<worker>/api/kasa/devices
    ```
+   The gas price comes from your Octopus gas tariff automatically. If you're not
+   on an Octopus gas tariff, set a manual rate: `PUT /api/octopus/tariff` with
+   `{"gas_price_p": 6.5}`.
 3. The `0,30 * * * *` cron evaluates every enabled rule each half hour. You can
    also trigger it manually:
    ```bash

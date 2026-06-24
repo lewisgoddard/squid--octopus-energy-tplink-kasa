@@ -64,6 +64,50 @@ async function fetchOctopusRates(env) {
 }
 
 /**
+ * Resolves and stores the account's active gas tariff code, mirroring syncTariff.
+ * @param {Env} env
+ */
+async function syncGasTariff(env) {
+  const response = await octopusFetch(
+    `https://api.octopus.energy/v1/accounts/${env.OCTOPUS_ACCOUNT}/`,
+    env
+  )
+  if (!response.ok) throw new Error(`Account lookup failed: ${response.status} ${await response.text()}`)
+  /** @type {any} */
+  const account = await response.json()
+  const now = new Date().toISOString()
+  const meterPoint = account.properties
+    ?.flatMap((/** @type {any} */ p) => p.gas_meter_points || [])
+    .find((/** @type {any} */ mp) => mp.mprn === env.GAS_MPRN)
+  if (!meterPoint) throw new Error(`MPRN ${env.GAS_MPRN} not found in account ${env.OCTOPUS_ACCOUNT}`)
+  const agreement = meterPoint.agreements?.find(
+    (/** @type {any} */ a) => a.valid_from <= now && (!a.valid_to || a.valid_to > now)
+  )
+  if (!agreement) throw new Error(`No active gas agreement found for MPRN ${env.GAS_MPRN}`)
+  await env.DATABASE.prepare(
+    "INSERT INTO tariffs (user_id, gas_tariff_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET gas_tariff_code = excluded.gas_tariff_code"
+  ).bind(env.USER_ID, agreement.tariff_code).run()
+  return agreement.tariff_code
+}
+
+/** @param {Env} env */
+async function fetchGasRates(env) {
+  /** @type {{ gas_tariff_code: string | null } | null} */
+  const row = await env.DATABASE.prepare(
+    "SELECT gas_tariff_code FROM tariffs WHERE user_id = ?"
+  ).bind(env.USER_ID).first()
+  if (!row || !row.gas_tariff_code) throw new Error(`No gas tariff configured for user ${env.USER_ID}`)
+  // Tariff code format: G-1R-{PRODUCT_CODE}-{REGION}
+  const productCode = row.gas_tariff_code.split("-").slice(2, -1).join("-")
+  const ratesURL = `https://api.octopus.energy/v1/products/${productCode}/gas-tariffs/${row.gas_tariff_code}/standard-unit-rates/?page_size=96`
+  const response = await octopusFetch(ratesURL, env)
+  if (!response.ok) throw new Error(`Gas rates fetch failed: ${response.status} ${await response.text()}`)
+  /** @type {Promise<any>} */
+  const json = response.json()
+  return json
+}
+
+/**
  * @param {string} url
  * @param {Env} env
  * @param {string} selfURL
@@ -92,6 +136,23 @@ async function updateRates(env) {
     )
       .bind(env.USER_ID + element.valid_from, env.USER_ID, element.valid_from, element.valid_to, element.value_inc_vat)
       .run()
+  }
+  // Gas rates back the 'cheaper_than_gas' strategy. A missing or non-standard gas
+  // tariff must not fail the electricity refresh, so isolate any gas failure.
+  try {
+    await syncGasTariff(env)
+    const { results: gasResults } = await fetchGasRates(env)
+    for (const element of gasResults) {
+      await env.DATABASE.prepare(
+        "insert or ignore into gas_rates (noduplicates, user_id, time_start, time_end, price) values (?, ?, ?, ?, ?)"
+      )
+        // Flat gas tariffs return an open-ended period (valid_to null); store a
+        // far-future end so the same time-window lookup as electricity works.
+        .bind(env.USER_ID + element.valid_from, env.USER_ID, element.valid_from, element.valid_to ?? "9999-12-31T00:00:00Z", element.value_inc_vat)
+        .run()
+    }
+  } catch (err) {
+    console.error("Gas rate refresh failed (cheaper_than_gas rules may be stale):", err)
   }
   return results
 }
@@ -272,6 +333,35 @@ async function cheapestStarts(env, dayPrefix, count) {
 }
 
 /**
+ * @param {Env} env
+ * @param {string} atISO
+ * @returns {Promise<{ time_start: string, time_end: string, price: string } | null>}
+ */
+async function currentGasRate(env, atISO) {
+  return env.DATABASE.prepare(
+    "SELECT time_start, time_end, price FROM gas_rates WHERE user_id = ? AND time_start <= ? AND time_end > ? ORDER BY time_start DESC LIMIT 1"
+  ).bind(env.USER_ID, atISO, atISO).first()
+}
+
+/**
+ * Gas unit price (pence/kWh) to compare against for 'cheaper_than_gas' rules:
+ * the per-user manual override if set, otherwise the fetched gas rate at `atISO`.
+ * Returns null when neither is available.
+ * @param {Env} env
+ * @param {string} atISO
+ * @returns {Promise<number | null>}
+ */
+async function gasPriceAt(env, atISO) {
+  /** @type {{ gas_price_p: number | null } | null} */
+  const cfg = await env.DATABASE.prepare(
+    "SELECT gas_price_p FROM tariffs WHERE user_id = ?"
+  ).bind(env.USER_ID).first()
+  if (cfg && cfg.gas_price_p != null) return cfg.gas_price_p
+  const row = await currentGasRate(env, atISO)
+  return row ? parseFloat(row.price) : null
+}
+
+/**
  * Evaluates every enabled device rule against the current rate and switches as needed.
  * @param {Env} env
  */
@@ -300,6 +390,13 @@ async function evaluateDevices(env) {
       const set = await cheapestStarts(env, nowISO.slice(0, 10), Math.max(1, Math.round(rule.hours * 2)))
       desired = set.has(rate.time_start)
       reason = `cheapest ${rule.hours}h${desired ? "" : " (not now)"}`
+    } else if (rule.strategy === "cheaper_than_gas") {
+      const gasPrice = await gasPriceAt(env, nowISO)
+      if (gasPrice == null) { actions.push({ device_id: rule.device_id, alias: dev.alias, skipped: "no gas rate" }); continue }
+      const eff = rule.efficiency ?? 1
+      const ceiling = gasPrice * eff
+      desired = price <= ceiling
+      reason = `${price}p ${desired ? "<=" : ">"} gas ${gasPrice}p×${eff} (${ceiling.toFixed(2)}p)`
     } else { // threshold
       desired = price <= rule.threshold_p
       reason = `${price}p ${desired ? "<=" : ">"} ${rule.threshold_p}p`
@@ -346,12 +443,27 @@ export default {
         if (auth !== `Bearer ${env.OCTOPUS_API_KEY}`) {
           return new Response("Unauthorized", { status: 401 })
         }
-        const { tariff_code } = await request.json()
-        if (!tariff_code) return new Response("Missing tariff_code", { status: 400 })
-        await env.DATABASE.prepare(
-          "INSERT INTO tariffs (user_id, tariff_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tariff_code = excluded.tariff_code"
-        ).bind(env.USER_ID, tariff_code).run()
-        return Response.json({ user_id: env.USER_ID, tariff_code })
+        const { tariff_code, gas_price_p } = await request.json()
+        if (tariff_code == null && gas_price_p === undefined) {
+          return new Response("Missing tariff_code or gas_price_p", { status: 400 })
+        }
+        if (tariff_code != null) {
+          await env.DATABASE.prepare(
+            "INSERT INTO tariffs (user_id, tariff_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tariff_code = excluded.tariff_code"
+          ).bind(env.USER_ID, tariff_code).run()
+        }
+        // gas_price_p is the manual override; pass null to clear it and fall back
+        // to the auto-fetched gas rate.
+        if (gas_price_p !== undefined) {
+          await env.DATABASE.prepare(
+            "INSERT INTO tariffs (user_id, gas_price_p) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET gas_price_p = excluded.gas_price_p"
+          ).bind(env.USER_ID, gas_price_p).run()
+        }
+        return Response.json({
+          user_id: env.USER_ID,
+          ...(tariff_code != null ? { tariff_code } : {}),
+          ...(gas_price_p !== undefined ? { gas_price_p } : {}),
+        })
       }
 
       if (pathname === "/api/octopus/tariff" && request.method === "GET") {
@@ -360,10 +472,15 @@ export default {
           return new Response("Unauthorized", { status: 401 })
         }
         const row = await env.DATABASE.prepare(
-          "SELECT tariff_code FROM tariffs WHERE user_id = ?"
+          "SELECT tariff_code, gas_tariff_code, gas_price_p FROM tariffs WHERE user_id = ?"
         ).bind(env.USER_ID).first()
         if (!row) return new Response("Not Found", { status: 404 })
-        return Response.json({ user_id: env.USER_ID, tariff_code: row.tariff_code })
+        return Response.json({
+          user_id: env.USER_ID,
+          tariff_code: row.tariff_code,
+          gas_tariff_code: row.gas_tariff_code,
+          gas_price_p: row.gas_price_p,
+        })
       }
 
       if (pathname === "/api/octopus/rates/cache") {
@@ -418,7 +535,7 @@ export default {
       if (pathname === "/api/kasa/devices" && request.method === "GET") {
         if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
         const { results } = await env.DATABASE.prepare(
-          "SELECT device_id, alias, strategy, threshold_p, hours, enabled FROM devices WHERE user_id = ?"
+          "SELECT device_id, alias, strategy, threshold_p, hours, efficiency, enabled FROM devices WHERE user_id = ?"
         ).bind(env.USER_ID).all()
         return Response.json({ results })
       }
@@ -427,20 +544,22 @@ export default {
         if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
         const body = await request.json()
         if (!body.device_id) return new Response("Missing device_id", { status: 400 })
-        if (!["threshold", "cheapest_hours"].includes(body.strategy)) {
-          return new Response("strategy must be 'threshold' or 'cheapest_hours'", { status: 400 })
+        if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
+          return new Response("strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'", { status: 400 })
         }
         if (body.strategy === "threshold" && body.threshold_p == null) return new Response("Missing threshold_p", { status: 400 })
         if (body.strategy === "cheapest_hours" && body.hours == null) return new Response("Missing hours", { status: 400 })
+        if (body.efficiency != null && !(body.efficiency > 0)) return new Response("efficiency must be a positive number", { status: 400 })
         await env.DATABASE.prepare(
-          `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, enabled)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, efficiency, enabled)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(device_id) DO UPDATE SET
              alias = excluded.alias, strategy = excluded.strategy,
-             threshold_p = excluded.threshold_p, hours = excluded.hours, enabled = excluded.enabled`
+             threshold_p = excluded.threshold_p, hours = excluded.hours,
+             efficiency = excluded.efficiency, enabled = excluded.enabled`
         ).bind(
           body.device_id, env.USER_ID, body.alias ?? null, body.strategy,
-          body.threshold_p ?? null, body.hours ?? null, body.enabled === false ? 0 : 1
+          body.threshold_p ?? null, body.hours ?? null, body.efficiency ?? 1, body.enabled === false ? 0 : 1
         ).run()
         return Response.json({ ...body, user_id: env.USER_ID })
       }
@@ -490,6 +609,11 @@ export default {
             if (rule.strategy === "cheapest_hours") {
               const set = await cheapestStarts(env, day, Math.max(1, Math.round(rule.hours * 2)))
               qualifies = (/** @type {{ time_start: string }} */ r) => set.has(r.time_start)
+            } else if (rule.strategy === "cheaper_than_gas") {
+              // Gas is typically a flat daily rate; take one price for the day (noon).
+              const gasPrice = await gasPriceAt(env, `${day}T12:00:00Z`)
+              const ceiling = gasPrice == null ? -Infinity : gasPrice * (rule.efficiency ?? 1)
+              qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= ceiling
             } else {
               qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= rule.threshold_p
             }
@@ -501,6 +625,7 @@ export default {
             strategy: rule.strategy,
             threshold_p: rule.threshold_p,
             hours: rule.hours,
+            efficiency: rule.efficiency,
             on_slots: slots.length,
             on_hours: slots.length / 2,
             slots,
