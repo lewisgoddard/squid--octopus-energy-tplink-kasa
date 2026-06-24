@@ -448,9 +448,18 @@ export default {
       if (pathname === "/api/kasa/devices/live" && request.method === "GET") {
         if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
         const devices = await kasaDeviceList(env)
-        return Response.json({
-          results: devices.map(d => ({ device_id: d.deviceId, alias: d.alias, model: d.deviceModel, status: d.status }))
-        })
+        const results = await Promise.all(devices.map(async d => ({
+          device_id: d.deviceId,
+          alias: d.alias,
+          model: d.deviceModel,
+          status: d.status,
+          // Relay state requires a per-device passthrough; only reachable when online.
+          // null = unknown (offline or read failed).
+          on: d.status === 1
+            ? await kasaReadState(env, d).then(s => s === 1).catch(() => null)
+            : null,
+        })))
+        return Response.json({ results })
       }
 
       if (pathname === "/api/kasa/sync" && request.method === "GET") {

@@ -173,7 +173,7 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 | `PUT /api/octopus/tariff` | Sets or updates the tariff code for the user. Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}`. |
 | `GET /api/kasa/devices` | Lists the configured device control rules from D1. Requires auth. |
 | `PUT /api/kasa/devices` | Creates or updates a device control rule. Requires auth. See [Kasa device control](#kasa-device-control). |
-| `GET /api/kasa/devices/live` | Lists the devices on your TP-Link Kasa cloud account (with their `device_id`s). Requires auth. |
+| `GET /api/kasa/devices/live` | Lists the devices on your TP-Link Kasa cloud account (with their `device_id`s), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). Requires auth. |
 | `GET /api/kasa/sync` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. Requires auth. |
 | `GET /api/kasa/usage` | Reads energy data from a device's emeter. Requires auth. Query: `device` (device_id or alias, required), `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
 | `GET /api/kasa/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). Requires auth. |
@@ -251,10 +251,12 @@ strategies are supported:
 
 #### Setup
 
-1. Find your devices and their `device_id`s:
+1. Find your devices and their `device_id`s (the response also shows each
+   device's online `status` and current `on` relay state):
    ```bash
    curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
      https://<worker>/api/kasa/devices/live
+   # {"results":[{"device_id":"80...","alias":"Smart Plug","model":"KP115(UK)","status":1,"on":true}]}
    ```
 2. Create a rule for a device:
    ```bash
