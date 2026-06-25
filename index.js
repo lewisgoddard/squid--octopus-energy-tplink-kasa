@@ -882,88 +882,115 @@ async function handleKasaDeviceRules(_request, env, _ctx, params) {
 }
 
 /**
- * Fetches a module's get_daystat day_list for the current month, plus the
- * previous month when `withPrev` (so a 7-day window near month-start is complete).
+ * Fetches a module's get_daystat day_list for the current + previous month (in
+ * parallel) — enough to cover a rolling 30-day window across a month boundary.
  * @param {Env} env
  * @param {KasaDevice} dev
  * @param {"emeter" | "schedule"} module
- * @param {number} year
- * @param {number} month
- * @param {boolean} withPrev
+ * @param {Date} now
  * @returns {Promise<any[]>}
  */
-async function dayStat(env, dev, module, year, month, withPrev) {
-  const get = async (/** @type {number} */ y, /** @type {number} */ m) => {
-    const data = await kasaPassthrough(env, dev, { [module]: { get_daystat: { year: y, month: m } } })
+async function recentDayStat(env, dev, module, now) {
+  const y = now.getUTCFullYear(), m = now.getUTCMonth() + 1
+  const py = m === 1 ? y - 1 : y, pm = m === 1 ? 12 : m - 1
+  const get = async (/** @type {number} */ yy, /** @type {number} */ mm) => {
+    const data = await kasaPassthrough(env, dev, { [module]: { get_daystat: { year: yy, month: mm } } })
     return data[module]?.get_daystat?.day_list || []
   }
-  const cur = await get(year, month)
-  if (!withPrev) return cur
-  const py = month === 1 ? year - 1 : year
-  const pm = month === 1 ? 12 : month - 1
-  return cur.concat(await get(py, pm))
+  const [cur, prev] = await Promise.all([get(y, m), get(py, pm)])
+  return cur.concat(prev)
 }
 
 /**
- * GET /api/kasa/devices/:id/stats — live energy + runtime stats matching the
- * Kasa app's Energy Use / Runtime views, with 7-day aggregates pre-computed.
- * Energy from the emeter module; runtime from get_sysinfo.on_time (current) and
- * the schedule module's get_daystat (per-day minutes).
+ * Today / last-7-day / last-30-day aggregates from a get_daystat day_list, using
+ * `val(entry)` to read each day's quantity.
+ * @param {any[]} list
+ * @param {(d: any) => number} val
+ * @param {Date} now
+ * @returns {{ today: number, last_7: { total: number, daily_avg: number }, last_30: { total: number, daily_avg: number } }}
+ */
+function aggregateDays(list, val, now) {
+  const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+  const sum = (/** @type {number} */ days) => {
+    const startUTC = todayUTC - (days - 1) * 86_400_000 // `days` calendar days incl. today
+    let total = 0
+    for (const d of list) {
+      const t = Date.UTC(d.year, d.month - 1, d.day)
+      if (t >= startUTC && t <= todayUTC) total += val(d)
+    }
+    return { total, daily_avg: Math.round((total / days) * 100) / 100 }
+  }
+  const today = list.find(d => Date.UTC(d.year, d.month - 1, d.day) === todayUTC)
+  return { today: today ? val(today) : 0, last_7: sum(7), last_30: sum(30) }
+}
+
+/**
+ * GET /api/kasa/devices/:id/energy — live energy use (emeter): realtime power +
+ * today / past-7-day / past-30-day consumption (Wh).
  * @param {Request} _request
  * @param {Env} env
  * @param {ExecutionContext} _ctx
  * @param {Record<string, string>} params
  * @returns {Promise<Response>}
  */
-async function handleKasaDeviceStats(_request, env, _ctx, params) {
+async function handleKasaDeviceEnergy(_request, env, _ctx, params) {
   const { device: dev, ambiguous } = await resolveDevice(env, params.id)
   if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!dev) return new Response("Not Found", { status: 404 })
   if (dev.status !== 1) return new Response("Device offline", { status: 409 })
 
   const now = new Date()
-  const year = now.getUTCFullYear(), month = now.getUTCMonth() + 1, day = now.getUTCDate()
-  const withPrev = day <= 7 // last-7-days window may reach into the previous month
-
-  const realtime = (await kasaPassthrough(env, dev, { emeter: { get_realtime: {} } })).emeter.get_realtime
-  const sysinfo = (await kasaPassthrough(env, dev, { system: { get_sysinfo: {} } })).system.get_sysinfo
-  const energyDays = await dayStat(env, dev, "emeter", year, month, withPrev)
-  const runtimeDays = await dayStat(env, dev, "schedule", year, month, withPrev)
-
-  // energy_wh (newer fw) or energy in kWh (older); schedule 'time' is minutes.
-  const energyOf = (/** @type {any} */ d) => d.energy_wh ?? (d.energy != null ? d.energy * 1000 : 0)
-  const runtimeOf = (/** @type {any} */ d) => d.time ?? 0
-  const startUTC = Date.UTC(year, month - 1, day - 6) // 7 days incl. today
-  const todayUTC = Date.UTC(year, month - 1, day)
-  const window = (/** @type {any[]} */ list, /** @type {(d: any) => number} */ val) => {
-    let total = 0
-    for (const d of list) {
-      const t = Date.UTC(d.year, d.month - 1, d.day)
-      if (t >= startUTC && t <= todayUTC) total += val(d)
-    }
-    return { total, daily_avg: Math.round((total / 7) * 100) / 100 }
-  }
-  const todayVal = (/** @type {any[]} */ list, /** @type {(d: any) => number} */ val) => {
-    const e = list.find(d => d.year === year && d.month === month && d.day === day)
-    return e ? val(e) : 0
-  }
-  const eWin = window(energyDays, energyOf), rWin = window(runtimeDays, runtimeOf)
-
+  const [realtimeData, days] = await Promise.all([
+    kasaPassthrough(env, dev, { emeter: { get_realtime: {} } }),
+    recentDayStat(env, dev, "emeter", now),
+  ])
+  const rt = realtimeData.emeter.get_realtime
+  // energy_wh (newer fw) or energy in kWh (older).
+  const agg = aggregateDays(days, (/** @type {any} */ d) => d.energy_wh ?? (d.energy != null ? d.energy * 1000 : 0), now)
   return Response.json({
     device_id: dev.deviceId,
     alias: dev.alias,
-    energy: {
-      current_power_w: realtime.power_mw != null ? realtime.power_mw / 1000 : (realtime.power ?? null),
-      voltage_v: realtime.voltage_mv != null ? realtime.voltage_mv / 1000 : (realtime.voltage ?? null),
-      current_a: realtime.current_ma != null ? realtime.current_ma / 1000 : (realtime.current ?? null),
-      today_wh: todayVal(energyDays, energyOf),
-      last_7_days: { total_wh: eWin.total, daily_avg_wh: eWin.daily_avg },
+    realtime: {
+      power_w: rt.power_mw != null ? rt.power_mw / 1000 : (rt.power ?? null),
+      voltage_v: rt.voltage_mv != null ? rt.voltage_mv / 1000 : (rt.voltage ?? null),
+      current_a: rt.current_ma != null ? rt.current_ma / 1000 : (rt.current ?? null),
     },
-    runtime: {
-      current_runtime_s: sysinfo.on_time ?? 0,
-      today_min: todayVal(runtimeDays, runtimeOf),
-      last_7_days: { total_min: rWin.total, daily_avg_min: rWin.daily_avg },
-    },
+    today: { total_wh: agg.today },
+    last_7_days: { total_wh: agg.last_7.total, daily_avg_wh: agg.last_7.daily_avg },
+    last_30_days: { total_wh: agg.last_30.total, daily_avg_wh: agg.last_30.daily_avg },
+  })
+}
+
+/**
+ * GET /api/kasa/devices/:id/runtime — live runtime: current on-session +
+ * today / past-7-day / past-30-day on-minutes.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDeviceRuntime(_request, env, _ctx, params) {
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
+  if (!dev) return new Response("Not Found", { status: 404 })
+  if (dev.status !== 1) return new Response("Device offline", { status: 409 })
+
+  const now = new Date()
+  const [sysData, days] = await Promise.all([
+    kasaPassthrough(env, dev, { system: { get_sysinfo: {} } }),
+    recentDayStat(env, dev, "schedule", now),
+  ])
+  const sysinfo = sysData.system.get_sysinfo
+  // schedule 'time' is minutes per day.
+  const agg = aggregateDays(days, (/** @type {any} */ d) => d.time ?? 0, now)
+  return Response.json({
+    device_id: dev.deviceId,
+    alias: dev.alias,
+    realtime: { current_runtime_s: sysinfo.on_time ?? 0 },
+    today: { total_min: agg.today },
+    last_7_days: { total_min: agg.last_7.total, daily_avg_min: agg.last_7.daily_avg },
+    last_30_days: { total_min: agg.last_30.total, daily_avg_min: agg.last_30.daily_avg },
   })
 }
 
@@ -1280,7 +1307,8 @@ const ROUTES = [
   ["GET",    "/api/kasa/devices/:id",           "devices:read",   handleKasaDevice],
   ["POST",   "/api/kasa/devices/:id/state",     "devices:control",handleKasaDeviceState],
   ["GET",    "/api/kasa/devices/:id/usage",     "meters:read",    handleKasaDeviceUsage],
-  ["GET",    "/api/kasa/devices/:id/stats",     "meters:read",    handleKasaDeviceStats],
+  ["GET",    "/api/kasa/devices/:id/energy",    "meters:read",    handleKasaDeviceEnergy],
+  ["GET",    "/api/kasa/devices/:id/runtime",   "meters:read",    handleKasaDeviceRuntime],
   ["GET",    "/api/kasa/devices/:id/rules",     "devices:read",   handleKasaDeviceRules],
   ["GET",    "/api/squid/rules",                     "rules:read",     handleSquidRulesList],
   ["POST",   "/api/squid/rules",                     "rules:write",    handleSquidRuleCreate],

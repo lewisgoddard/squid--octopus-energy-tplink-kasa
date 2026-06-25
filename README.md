@@ -226,7 +226,8 @@ All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 | `GET` | `/api/kasa/devices/:id` | Returns the **live** state of a single device. `:id` is a `device_id` or alias. |
 | `POST` | `/api/kasa/devices/:id/state` | Manually switch a device on or off. Body: `{"on": true}`. Logs a `manual` entry. |
 | `GET` | `/api/kasa/devices/:id/usage` | Reads raw energy data from a device's emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
-| `GET` | `/api/kasa/devices/:id/stats` | Live energy + runtime stats (the Kasa app's Energy Use / Runtime views) with 7-day aggregates pre-computed. Returns `energy` (`current_power_w`, `voltage_v`, `current_a`, `today_wh`, `last_7_days: {total_wh, daily_avg_wh}`) and `runtime` (`current_runtime_s` = current on-session, `today_min`, `last_7_days: {total_min, daily_avg_min}`). Energy from the emeter module; runtime from `get_sysinfo.on_time` + the `schedule` module's per-day minutes. |
+| `GET` | `/api/kasa/devices/:id/energy` | Live **energy use** (Kasa app's Energy Use view). Returns `realtime` (`power_w`, `voltage_v`, `current_a`), `today` (`total_wh`), `last_7_days` and `last_30_days` (each `total_wh` + `daily_avg_wh`). From the emeter module. |
+| `GET` | `/api/kasa/devices/:id/runtime` | Live **runtime** (Kasa app's Runtime view). Returns `realtime` (`current_runtime_s` = current on-session), `today` (`total_min`), `last_7_days` and `last_30_days` (each `total_min` + `daily_avg_min`). From `get_sysinfo.on_time` + the `schedule` module's per-day minutes. |
 | `GET` | `/api/kasa/devices/:id/rules` | Reads the on-device firmware rules for a device (`schedule`, `count_down`, `anti_theft`). Note: this only surfaces device-level rules set in the Kasa app's "Device" section — cloud Smart Actions (geofencing, device triggers) are **not** retrievable via this API. |
 
 #### `squid/` — rate-based automation
