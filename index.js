@@ -882,6 +882,92 @@ async function handleKasaDeviceRules(_request, env, _ctx, params) {
 }
 
 /**
+ * Fetches a module's get_daystat day_list for the current month, plus the
+ * previous month when `withPrev` (so a 7-day window near month-start is complete).
+ * @param {Env} env
+ * @param {KasaDevice} dev
+ * @param {"emeter" | "schedule"} module
+ * @param {number} year
+ * @param {number} month
+ * @param {boolean} withPrev
+ * @returns {Promise<any[]>}
+ */
+async function dayStat(env, dev, module, year, month, withPrev) {
+  const get = async (/** @type {number} */ y, /** @type {number} */ m) => {
+    const data = await kasaPassthrough(env, dev, { [module]: { get_daystat: { year: y, month: m } } })
+    return data[module]?.get_daystat?.day_list || []
+  }
+  const cur = await get(year, month)
+  if (!withPrev) return cur
+  const py = month === 1 ? year - 1 : year
+  const pm = month === 1 ? 12 : month - 1
+  return cur.concat(await get(py, pm))
+}
+
+/**
+ * GET /api/kasa/devices/:id/stats — live energy + runtime stats matching the
+ * Kasa app's Energy Use / Runtime views, with 7-day aggregates pre-computed.
+ * Energy from the emeter module; runtime from get_sysinfo.on_time (current) and
+ * the schedule module's get_daystat (per-day minutes).
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDeviceStats(_request, env, _ctx, params) {
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
+  if (!dev) return new Response("Not Found", { status: 404 })
+  if (dev.status !== 1) return new Response("Device offline", { status: 409 })
+
+  const now = new Date()
+  const year = now.getUTCFullYear(), month = now.getUTCMonth() + 1, day = now.getUTCDate()
+  const withPrev = day <= 7 // last-7-days window may reach into the previous month
+
+  const realtime = (await kasaPassthrough(env, dev, { emeter: { get_realtime: {} } })).emeter.get_realtime
+  const sysinfo = (await kasaPassthrough(env, dev, { system: { get_sysinfo: {} } })).system.get_sysinfo
+  const energyDays = await dayStat(env, dev, "emeter", year, month, withPrev)
+  const runtimeDays = await dayStat(env, dev, "schedule", year, month, withPrev)
+
+  // energy_wh (newer fw) or energy in kWh (older); schedule 'time' is minutes.
+  const energyOf = (/** @type {any} */ d) => d.energy_wh ?? (d.energy != null ? d.energy * 1000 : 0)
+  const runtimeOf = (/** @type {any} */ d) => d.time ?? 0
+  const startUTC = Date.UTC(year, month - 1, day - 6) // 7 days incl. today
+  const todayUTC = Date.UTC(year, month - 1, day)
+  const window = (/** @type {any[]} */ list, /** @type {(d: any) => number} */ val) => {
+    let total = 0
+    for (const d of list) {
+      const t = Date.UTC(d.year, d.month - 1, d.day)
+      if (t >= startUTC && t <= todayUTC) total += val(d)
+    }
+    return { total, daily_avg: Math.round((total / 7) * 100) / 100 }
+  }
+  const todayVal = (/** @type {any[]} */ list, /** @type {(d: any) => number} */ val) => {
+    const e = list.find(d => d.year === year && d.month === month && d.day === day)
+    return e ? val(e) : 0
+  }
+  const eWin = window(energyDays, energyOf), rWin = window(runtimeDays, runtimeOf)
+
+  return Response.json({
+    device_id: dev.deviceId,
+    alias: dev.alias,
+    energy: {
+      current_power_w: realtime.power_mw != null ? realtime.power_mw / 1000 : (realtime.power ?? null),
+      voltage_v: realtime.voltage_mv != null ? realtime.voltage_mv / 1000 : (realtime.voltage ?? null),
+      current_a: realtime.current_ma != null ? realtime.current_ma / 1000 : (realtime.current ?? null),
+      today_wh: todayVal(energyDays, energyOf),
+      last_7_days: { total_wh: eWin.total, daily_avg_wh: eWin.daily_avg },
+    },
+    runtime: {
+      current_runtime_s: sysinfo.on_time ?? 0,
+      today_min: todayVal(runtimeDays, runtimeOf),
+      last_7_days: { total_min: rWin.total, daily_avg_min: rWin.daily_avg },
+    },
+  })
+}
+
+/**
  * Validates a rule definition body. Returns an error string, or null if valid.
  * @param {any} body
  * @returns {string | null}
@@ -1194,6 +1280,7 @@ const ROUTES = [
   ["GET",    "/api/kasa/devices/:id",           "devices:read",   handleKasaDevice],
   ["POST",   "/api/kasa/devices/:id/state",     "devices:control",handleKasaDeviceState],
   ["GET",    "/api/kasa/devices/:id/usage",     "meters:read",    handleKasaDeviceUsage],
+  ["GET",    "/api/kasa/devices/:id/stats",     "meters:read",    handleKasaDeviceStats],
   ["GET",    "/api/kasa/devices/:id/rules",     "devices:read",   handleKasaDeviceRules],
   ["GET",    "/api/squid/rules",                     "rules:read",     handleSquidRulesList],
   ["POST",   "/api/squid/rules",                     "rules:write",    handleSquidRuleCreate],
@@ -1223,7 +1310,11 @@ function matchRoute(pattern, pathname) {
   for (let i = 0; i < patSegs.length; i++) {
     const p = patSegs[i]
     if (p.startsWith(":")) {
-      params[p.slice(1)] = urlSegs[i]
+      // Percent-decode so aliases with spaces/special chars (e.g. "Smart Plug")
+      // resolve correctly; fall back to the raw segment if malformed.
+      let v = urlSegs[i]
+      try { v = decodeURIComponent(v) } catch { /* keep raw */ }
+      params[p.slice(1)] = v
     } else if (p !== urlSegs[i]) {
       return null
     }
