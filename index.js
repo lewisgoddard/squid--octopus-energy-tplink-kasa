@@ -22,15 +22,26 @@ async function octopusFetch(url, env) {
   })
 }
 
-/** @param {Env} env */
-async function syncTariff(env) {
+/**
+ * Fetches the Octopus account JSON (properties, meter points, agreements).
+ * @param {Env} env
+ * @returns {Promise<any>}
+ */
+async function fetchOctopusAccount(env) {
   const response = await octopusFetch(
     `https://api.octopus.energy/v1/accounts/${env.OCTOPUS_ACCOUNT}/`,
     env
   )
   if (!response.ok) throw new Error(`Account lookup failed: ${response.status} ${await response.text()}`)
-  /** @type {any} */
-  const account = await response.json()
+  return response.json()
+}
+
+/**
+ * @param {Env} env
+ * @param {any} [account] pre-fetched account JSON, to avoid a duplicate lookup
+ */
+async function syncTariff(env, account) {
+  account ??= await fetchOctopusAccount(env)
   const now = new Date().toISOString()
   const meterPoint = account.properties
     ?.flatMap((/** @type {any} */ p) => p.electricity_meter_points || [])
@@ -66,15 +77,10 @@ async function fetchOctopusRates(env) {
 /**
  * Resolves and stores the account's active gas tariff code, mirroring syncTariff.
  * @param {Env} env
+ * @param {any} [account] pre-fetched account JSON, to avoid a duplicate lookup
  */
-async function syncGasTariff(env) {
-  const response = await octopusFetch(
-    `https://api.octopus.energy/v1/accounts/${env.OCTOPUS_ACCOUNT}/`,
-    env
-  )
-  if (!response.ok) throw new Error(`Account lookup failed: ${response.status} ${await response.text()}`)
-  /** @type {any} */
-  const account = await response.json()
+async function syncGasTariff(env, account) {
+  account ??= await fetchOctopusAccount(env)
   const now = new Date().toISOString()
   const meterPoint = account.properties
     ?.flatMap((/** @type {any} */ p) => p.gas_meter_points || [])
@@ -155,7 +161,9 @@ async function updateRates(env) {
     return { refreshed: false, reason: "today cached; tomorrow not published yet", through: latest }
   }
 
-  await syncTariff(env)
+  // Fetch the account once and reuse it for both tariff lookups.
+  const account = await fetchOctopusAccount(env)
+  await syncTariff(env, account)
   const { results } = await fetchOctopusRates(env)
   for (const element of results) {
     await env.DATABASE.prepare(
@@ -167,7 +175,7 @@ async function updateRates(env) {
   // Gas rates back the 'cheaper_than_gas' strategy. A missing or non-standard gas
   // tariff must not fail the electricity refresh, so isolate any gas failure.
   try {
-    await syncGasTariff(env)
+    await syncGasTariff(env, account)
     const { results: gasResults } = await fetchGasRates(env)
     for (const element of gasResults) {
       await env.DATABASE.prepare(
@@ -181,7 +189,9 @@ async function updateRates(env) {
   } catch (err) {
     console.error("Gas rate refresh failed (cheaper_than_gas rules may be stale):", err)
   }
-  return { refreshed: true, inserted: results.length, through: results.at(-1)?.valid_to ?? null }
+  // Octopus returns rates newest-first; report the furthest-out coverage.
+  const through = results.reduce((/** @type {string} */ m, /** @type {any} */ r) => (r.valid_to > m ? r.valid_to : m), "")
+  return { refreshed: true, inserted: results.length, through: through || null }
 }
 
 // --- TP-Link Kasa cloud control ---------------------------------------------
