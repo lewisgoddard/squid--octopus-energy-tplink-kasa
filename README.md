@@ -135,7 +135,7 @@ The worker runs on two cron triggers, configured in `wrangler.toml`:
 
 | Cron | Action |
 |------|--------|
-| `32 */4 * * *` | Fetch the latest rates and insert them into D1 (same as `POST /api/octopus/rates/refresh`). |
+| `32 * * * *` | Refresh rates into D1 (same as `POST /api/octopus/rates/refresh`). Runs hourly, but `updateRates` skips the Octopus API pull when today + tomorrow are already cached (and before the ~4pm publish if tomorrow isn't out yet), so most runs are cheap no-ops. |
 | `0,30 * * * *` | Evaluate the Squid device rules against the current rate and switch as needed (same as `POST /api/squid/evaluate`). |
 
 The `scheduled()` handler dispatches on `event.cron`. Adjust the schedules as needed before deploying.
@@ -201,7 +201,7 @@ All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 |--------|------|-------------|
 | `GET` | `/api/octopus/rates` | Returns rate entries from the D1 cache, ordered by most recent first. Supports query parameters (see below). |
 | `GET` | `/api/octopus/rates/live` | Fetches and returns the current unit rates directly from the Octopus Energy API without reading from or writing to the database. |
-| `POST` | `/api/octopus/rates/refresh` | Fetches the latest Agile tariff half-hourly unit rates from the Octopus Energy API and inserts them into the D1 database. Returns the inserted rate data. |
+| `POST` | `/api/octopus/rates/refresh` | Refreshes the latest Agile tariff half-hourly unit rates (and gas) from Octopus into D1. Skips the API pull when today + tomorrow are already cached, returning `{"refreshed":false,"reason":...}`; otherwise returns `{"refreshed":true,"inserted":N}`. |
 | `GET` | `/api/octopus/tariff` | Returns the configured tariff for the user: `tariff_code`, the auto-discovered `gas_tariff_code`, and the `gas_price_p` override (if any). |
 | `PUT` | `/api/octopus/tariff` | Sets the electricity tariff and/or the gas price override. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}` and/or `{"gas_price_p": 6.5}` (pass `gas_price_p: null` to clear the override and fall back to the auto-fetched gas rate). |
 | `GET` | `/api/octopus/meters/:fuel` | Fetches consumption data from the Octopus Energy API. `:fuel` is `electricity` or `gas`. |

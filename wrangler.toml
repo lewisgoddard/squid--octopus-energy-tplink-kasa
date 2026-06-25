@@ -3,9 +3,10 @@ main = "index.js"
 compatibility_date = "2026-06-01"
 
 [triggers]
-# 32 */4 * * *  -> refresh Octopus rates (every 4 hours)
+# 32 * * * *    -> refresh Octopus rates (hourly; updateRates skips the API pull
+#                  when today+tomorrow are already cached, so most runs are no-ops)
 # 0,30 * * * *  -> evaluate Kasa devices against the current rate (every half hour)
-crons = ["32 */4 * * *", "0,30 * * * *"]
+crons = ["32 * * * *", "0,30 * * * *"]
 
 [[d1_databases]]
 binding = "DATABASE"

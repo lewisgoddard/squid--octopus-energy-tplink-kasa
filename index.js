@@ -126,8 +126,35 @@ async function fetchOctopusMeter(url, env, selfURL) {
   return Response.json({ count: data.count, next, previous, results: data.results })
 }
 
-/** @param {Env} env */
+// Next-day Agile rates publish in the afternoon (~4pm UK). 15:00 UTC ≈ 16:00 BST;
+// before then there's nothing new to fetch, so we don't pull just to re-confirm
+// today. (In winter/GMT this is ~3pm, an hour early — harmless, it just retries.)
+const RATES_PUBLISH_HOUR_UTC = 15
+
+/**
+ * Refreshes Octopus rates into D1, but skips the API pull when it would be
+ * wasteful: when today + tomorrow are already cached, or (before the afternoon
+ * publish) when today is cached and tomorrow isn't out yet. Lets the cron run
+ * frequently without hammering the Octopus API.
+ * @param {Env} env
+ */
 async function updateRates(env) {
+  const now = new Date()
+  const today = now.toISOString().slice(0, 10)
+  const tomorrow = new Date(now.getTime() + 86_400_000).toISOString().slice(0, 10)
+  /** @type {{ max: string | null } | null} */
+  const row = await env.DATABASE.prepare(
+    "SELECT MAX(time_start) AS max FROM rates WHERE user_id = ?"
+  ).bind(env.USER_ID).first()
+  const latest = row?.max ?? ""
+  // The last half-hour slot of a UTC day starts at 23:30Z.
+  if (latest >= `${tomorrow}T23:30:00Z`) {
+    return { refreshed: false, reason: "today and tomorrow already cached", through: latest }
+  }
+  if (latest >= `${today}T23:30:00Z` && now.getUTCHours() < RATES_PUBLISH_HOUR_UTC) {
+    return { refreshed: false, reason: "today cached; tomorrow not published yet", through: latest }
+  }
+
   await syncTariff(env)
   const { results } = await fetchOctopusRates(env)
   for (const element of results) {
@@ -154,7 +181,7 @@ async function updateRates(env) {
   } catch (err) {
     console.error("Gas rate refresh failed (cheaper_than_gas rules may be stale):", err)
   }
-  return results
+  return { refreshed: true, inserted: results.length, through: results.at(-1)?.valid_to ?? null }
 }
 
 // --- TP-Link Kasa cloud control ---------------------------------------------
