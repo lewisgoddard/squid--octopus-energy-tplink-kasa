@@ -535,17 +535,57 @@ function hasPermission(request, env, permission) {
   return request.headers.get("Authorization") === `Bearer ${env.SQUID_API_KEY}`
 }
 
+// Short-TTL edge cache for read-heavy GETs. Rates change only on a refresh and
+// forecast is a preview, so a few seconds' staleness is fine; no explicit busting.
+const CACHE_TTL_SECONDS = 60
+
+/**
+ * Serves a GET from the per-colo Cache API when fresh, else computes and caches
+ * it for `ttl` seconds. The cache key is the URL plus the user id, so it stays
+ * correct once requests resolve to different users. Auth is enforced by the
+ * router before this runs.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} ctx
+ * @param {number} ttl seconds
+ * @param {() => Promise<Response>} compute
+ * @returns {Promise<Response>}
+ */
+async function cachedResponse(request, env, ctx, ttl, compute) {
+  const cache = caches.default
+  const keyURL = new URL(request.url)
+  keyURL.searchParams.set("__uid", env.USER_ID) // user-scope the cache key
+  const key = new Request(keyURL.toString(), { method: "GET" })
+  const hit = await cache.match(key)
+  if (hit) return hit
+  const res = await compute()
+  if (res.ok) {
+    res.headers.set("Cache-Control", `max-age=${ttl}`)
+    ctx.waitUntil(cache.put(key, res.clone()))
+  }
+  return res
+}
+
 // --- Route handlers ---------------------------------------------------------
 
 /**
- * GET /api/octopus/rates — paginated cached rates.
+ * GET /api/octopus/rates — paginated cached rates (short-TTL edge cache, per user).
  * @param {Request} request
  * @param {Env} env
- * @param {ExecutionContext} _ctx
+ * @param {ExecutionContext} ctx
  * @param {Record<string, string>} _params
  * @returns {Promise<Response>}
  */
-async function handleOctopusRates(request, env, _ctx, _params) {
+async function handleOctopusRates(request, env, ctx, _params) {
+  return cachedResponse(request, env, ctx, CACHE_TTL_SECONDS, () => computeOctopusRates(request, env))
+}
+
+/**
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {Promise<Response>}
+ */
+async function computeOctopusRates(request, env) {
   const { searchParams } = new URL(request.url)
   const limit = Math.min(parseInt(searchParams.get("limit") || "96", 10), 96)
   const page = Math.max(parseInt(searchParams.get("page") || "1", 10), 1)
@@ -1012,15 +1052,23 @@ async function handleSquidRuleUntagDevice(_request, env, _ctx, params) {
 }
 
 /**
- * GET /api/squid/forecast — per-rule preview of which slots each enabled rule
- * would fire, plus the devices it is tagged to.
+ * GET /api/squid/forecast — per-rule preview (short-TTL edge cache, per user).
  * @param {Request} request
  * @param {Env} env
- * @param {ExecutionContext} _ctx
+ * @param {ExecutionContext} ctx
  * @param {Record<string, string>} _params
  * @returns {Promise<Response>}
  */
-async function handleSquidForecast(request, env, _ctx, _params) {
+async function handleSquidForecast(request, env, ctx, _params) {
+  return cachedResponse(request, env, ctx, CACHE_TTL_SECONDS, () => computeSquidForecast(request, env))
+}
+
+/**
+ * @param {Request} request
+ * @param {Env} env
+ * @returns {Promise<Response>}
+ */
+async function computeSquidForecast(request, env) {
   const { searchParams } = new URL(request.url)
   const today = new Date().toISOString().slice(0, 10)
   const param = searchParams.get("date")
