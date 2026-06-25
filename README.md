@@ -202,8 +202,8 @@ All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 | `GET` | `/api/octopus/rates` | Returns rate entries from the D1 cache, ordered by most recent first. Supports query parameters (see below). |
 | `GET` | `/api/octopus/rates/live` | Fetches and returns the current unit rates directly from the Octopus Energy API without reading from or writing to the database. |
 | `POST` | `/api/octopus/rates/refresh` | Refreshes the latest Agile tariff half-hourly unit rates (and gas) from Octopus into D1. Skips the API pull when today + tomorrow are already cached, returning `{"refreshed":false,"reason":...}`; otherwise returns `{"refreshed":true,"inserted":N}`. |
-| `GET` | `/api/octopus/tariff` | Returns the configured tariff for the user: `tariff_code`, the auto-discovered `gas_tariff_code`, and the `gas_price_p` override (if any). |
-| `PUT` | `/api/octopus/tariff` | Sets the electricity tariff and/or the gas price override. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}` and/or `{"gas_price_p": 6.5}` (pass `gas_price_p: null` to clear the override and fall back to the auto-fetched gas rate). |
+| `GET` | `/api/octopus/tariff` | Returns the configured tariff: `account` (Octopus account id), `tariff_code`, `gas_tariff_code`, `gas_rate_p` (the auto-fetched flat gas unit rate), `gas_price_override_p` (manual override, if set), and `gas_price_effective_p` (override ?? fetched — what `cheaper_than_gas` actually uses). |
+| `PUT` | `/api/octopus/tariff` | Sets the electricity tariff and/or the gas price override. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}` and/or `{"gas_price_override_p": 6.5}` (pass `gas_price_override_p: null` to clear the override and fall back to the auto-fetched gas rate). |
 | `GET` | `/api/octopus/meters/:fuel` | Fetches consumption data from the Octopus Energy API. `:fuel` is `electricity` or `gas`. |
 
 #### `kasa/` — TP-Link hardware proxy
@@ -307,7 +307,7 @@ supported:
 |----------|--------|-----------|
 | `threshold` | `threshold_p` | On when the current half-hourly price is at or below `threshold_p` pence, off otherwise. |
 | `cheapest_hours` | `hours` | On during the cheapest `hours` hours of the current (UTC) day, off otherwise. Good for charging-type loads. |
-| `cheaper_than_gas` | `efficiency` | On when the current electricity price is at or below `gas_price × efficiency` pence, off otherwise. `efficiency` (default `1`) is the device's output-per-unit advantage over gas — e.g. `~3.3` for a heat pump (COP 3) vs a 90% boiler, `~1.1` for a resistive heater. The gas price is the `gas_price_p` override if set, else the gas unit rate auto-fetched from your Octopus gas tariff. |
+| `cheaper_than_gas` | `efficiency` | On when the current electricity price is at or below `gas_price × efficiency` pence, off otherwise. `efficiency` (default `1`) is the device's output-per-unit advantage over gas — e.g. `~3.3` for a heat pump (COP 3) vs a 90% boiler, `~1.1` for a resistive heater. The gas price is the `gas_price_override_p` if set, else the flat gas unit rate auto-fetched from your Octopus gas tariff (see `GET /api/octopus/tariff`). |
 
 #### Setup
 
@@ -334,7 +334,7 @@ supported:
    ```
    The gas price comes from your Octopus gas tariff automatically. If you're not
    on an Octopus gas tariff, set a manual rate: `PUT /api/octopus/tariff` with
-   `{"gas_price_p": 6.5}`.
+   `{"gas_price_override_p": 6.5}`.
 3. Tag or untag devices on a rule at any time (without deleting the rule).
    `:id` may be a `device_id` or a (unique) alias:
    ```bash

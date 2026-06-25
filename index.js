@@ -608,11 +608,19 @@ async function handleOctopusTariffGet(_request, env, _ctx, _params) {
     "SELECT tariff_code, gas_tariff_code, gas_price_p FROM tariffs WHERE user_id = ?"
   ).bind(env.USER_ID).first()
   if (!row) return new Response("Not Found", { status: 404 })
+  // The auto-fetched flat gas unit rate (from gas_rates). The manual override,
+  // if set, takes precedence over it for cheaper_than_gas.
+  const gasRow = await currentGasRate(env, new Date().toISOString())
+  const gas_rate_p = gasRow ? parseFloat(gasRow.price) : null
+  const gas_price_override_p = /** @type {number | null} */ (row.gas_price_p)
   return Response.json({
     user_id: env.USER_ID,
+    account: env.OCTOPUS_ACCOUNT,
     tariff_code: row.tariff_code,
     gas_tariff_code: row.gas_tariff_code,
-    gas_price_p: row.gas_price_p,
+    gas_rate_p,
+    gas_price_override_p,
+    gas_price_effective_p: gas_price_override_p ?? gas_rate_p,
   })
 }
 
@@ -625,26 +633,28 @@ async function handleOctopusTariffGet(_request, env, _ctx, _params) {
  * @returns {Promise<Response>}
  */
 async function handleOctopusTariffPut(request, env, _ctx, _params) {
-  const { tariff_code, gas_price_p } = await request.json()
-  if (tariff_code == null && gas_price_p === undefined) {
-    return new Response("Missing tariff_code or gas_price_p", { status: 400 })
+  const body = await request.json()
+  const tariff_code = body.tariff_code
+  const gas_price_override_p = body.gas_price_override_p
+  if (tariff_code == null && gas_price_override_p === undefined) {
+    return new Response("Missing tariff_code or gas_price_override_p", { status: 400 })
   }
   if (tariff_code != null) {
     await env.DATABASE.prepare(
       "INSERT INTO tariffs (user_id, tariff_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tariff_code = excluded.tariff_code"
     ).bind(env.USER_ID, tariff_code).run()
   }
-  // gas_price_p is the manual override; pass null to clear it and fall back
-  // to the auto-fetched gas rate.
-  if (gas_price_p !== undefined) {
+  // The override (stored in the gas_price_p column) wins over the auto-fetched
+  // flat gas rate; pass null to clear it and fall back to the fetched rate.
+  if (gas_price_override_p !== undefined) {
     await env.DATABASE.prepare(
       "INSERT INTO tariffs (user_id, gas_price_p) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET gas_price_p = excluded.gas_price_p"
-    ).bind(env.USER_ID, gas_price_p).run()
+    ).bind(env.USER_ID, gas_price_override_p).run()
   }
   return Response.json({
     user_id: env.USER_ID,
     ...(tariff_code != null ? { tariff_code } : {}),
-    ...(gas_price_p !== undefined ? { gas_price_p } : {}),
+    ...(gas_price_override_p !== undefined ? { gas_price_override_p } : {}),
   })
 }
 
@@ -1157,8 +1167,7 @@ export default {
       // Root help text (public, no auth)
       if (pathname === "/") {
         return new Response(
-          "Hi! GET /api/octopus/rates for cached electricity rates, " +
-          "/api/octopus/rates/live for live rates, " +
+          "Hi! GET /api/octopus/rates for electricity rates, " +
           "/api/kasa/devices for device list."
         )
       }
