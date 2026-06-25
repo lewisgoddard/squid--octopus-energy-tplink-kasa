@@ -228,6 +228,39 @@ async function kasaDeviceList(env) {
   return result.deviceList || []
 }
 
+// Module-global cache of the TP-Link device list, to limit cloud calls (and the
+// account-lockout risk). Best-effort and per-isolate with a short TTL — fresh
+// enough for name resolution and display while sparing the cloud from a call on
+// every request. The cron's evaluateDevices intentionally bypasses this and
+// reads live, since switching decisions need current relay state.
+/** @type {{ data: KasaDevice[] | null, expires: number }} */
+let _deviceListCache = { data: null, expires: 0 }
+const DEVICE_LIST_TTL_MS = 60_000
+
+/**
+ * @param {Env} env
+ * @returns {Promise<KasaDevice[]>}
+ */
+async function cachedDeviceList(env) {
+  const now = Date.now()
+  if (_deviceListCache.data && _deviceListCache.expires > now) return _deviceListCache.data
+  const data = await kasaDeviceList(env)
+  _deviceListCache = { data, expires: now + DEVICE_LIST_TTL_MS }
+  return data
+}
+
+/**
+ * Map of deviceId -> current live alias, for overlaying display names onto
+ * stored rows. Resilient: returns an empty map if the cloud is unreachable so
+ * reads fall back to the stored alias rather than failing.
+ * @param {Env} env
+ * @returns {Promise<Map<string, string | undefined>>}
+ */
+async function liveAliasMap(env) {
+  const devices = await cachedDeviceList(env).catch(() => /** @type {KasaDevice[]} */ ([]))
+  return new Map(devices.map(d => [d.deviceId, d.alias]))
+}
+
 /**
  * @param {Env} env
  * @param {KasaDevice} dev
@@ -263,15 +296,22 @@ async function kasaSetState(env, dev, on) {
 }
 
 /**
- * Resolves a live device by its deviceId or (case-insensitive) alias.
+ * Resolves a device by its deviceId or (case-insensitive) alias, from the cached
+ * device list. deviceId always wins (it is unique). An alias matching more than
+ * one device is reported as ambiguous rather than silently guessed, since
+ * TP-Link does not enforce unique aliases.
  * @param {Env} env
  * @param {string} identifier
- * @returns {Promise<KasaDevice | null>}
+ * @returns {Promise<{ device: KasaDevice | null, ambiguous: boolean }>}
  */
-async function findKasaDevice(env, identifier) {
-  const devices = await kasaDeviceList(env)
-  const id = identifier.toLowerCase()
-  return devices.find(d => d.deviceId === identifier || (d.alias || "").toLowerCase() === id) || null
+async function resolveDevice(env, identifier) {
+  const devices = await cachedDeviceList(env)
+  const byId = devices.find(d => d.deviceId === identifier)
+  if (byId) return { device: byId, ambiguous: false }
+  const name = identifier.toLowerCase()
+  const matches = devices.filter(d => (d.alias || "").toLowerCase() === name)
+  if (matches.length === 1) return { device: matches[0], ambiguous: false }
+  return { device: null, ambiguous: matches.length > 1 }
 }
 
 /**
@@ -599,7 +639,8 @@ async function handleKasaDevices(_request, env, _ctx, _params) {
  * @returns {Promise<Response>}
  */
 async function handleKasaDevice(_request, env, _ctx, params) {
-  const dev = await findKasaDevice(env, params.id)
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!dev) return new Response("Not Found", { status: 404 })
   return Response.json({
     device_id: dev.deviceId,
@@ -625,7 +666,8 @@ async function handleKasaDeviceState(request, env, _ctx, params) {
   if (typeof body.on !== "boolean") {
     return new Response("Body must include 'on' as a boolean", { status: 400 })
   }
-  const dev = await findKasaDevice(env, params.id)
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!dev) return new Response("Not Found", { status: 404 })
   if (dev.status !== 1) return new Response("Device offline", { status: 409 })
   await kasaSetState(env, dev, body.on)
@@ -653,7 +695,8 @@ async function handleKasaDeviceUsage(request, env, _ctx, params) {
   const now = new Date()
   const year = parseInt(searchParams.get("year") || String(now.getUTCFullYear()), 10)
   const month = parseInt(searchParams.get("month") || String(now.getUTCMonth() + 1), 10)
-  const dev = await findKasaDevice(env, params.id)
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!dev) return new Response("Not Found", { status: 404 })
   if (dev.status !== 1) return new Response("Device offline", { status: 409 })
   return Response.json({
@@ -674,7 +717,8 @@ async function handleKasaDeviceUsage(request, env, _ctx, params) {
  * @returns {Promise<Response>}
  */
 async function handleKasaDeviceRules(_request, env, _ctx, params) {
-  const dev = await findKasaDevice(env, params.id)
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!dev) return new Response("Not Found", { status: 404 })
   if (dev.status !== 1) return new Response("Device offline", { status: 409 })
   const [scheduleData, countDownData, antiTheftData] = await Promise.all([
@@ -703,7 +747,11 @@ async function handleSquidRules(_request, env, _ctx, _params) {
   const { results } = await env.DATABASE.prepare(
     "SELECT device_id, alias, strategy, threshold_p, hours, efficiency, enabled FROM devices WHERE user_id = ?"
   ).bind(env.USER_ID).all()
-  return Response.json({ results })
+  // Overlay the current live alias (display-only); fall back to the stored name
+  // if TP-Link is unreachable or the device is gone.
+  const aliasById = await liveAliasMap(env)
+  const enriched = /** @type {any[]} */ (results).map(r => ({ ...r, alias: aliasById.get(r.device_id) ?? r.alias }))
+  return Response.json({ results: enriched })
 }
 
 /**
@@ -716,13 +764,23 @@ async function handleSquidRules(_request, env, _ctx, _params) {
  */
 async function handleSquidRulesPut(request, env, _ctx, params) {
   const body = await request.json()
-  const device_id = params.deviceId
   if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
     return new Response("strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'", { status: 400 })
   }
   if (body.strategy === "threshold" && body.threshold_p == null) return new Response("Missing threshold_p", { status: 400 })
   if (body.strategy === "cheapest_hours" && body.hours == null) return new Response("Missing hours", { status: 400 })
   if (body.efficiency != null && !(body.efficiency > 0)) return new Response("efficiency must be a positive number", { status: 400 })
+  // Resolve :deviceId (deviceId or alias) to a real device so rules always key
+  // on the immutable deviceId and can't be created against a non-existent device
+  // or an ambiguous name.
+  const { device: dev, ambiguous } = await resolveDevice(env, params.deviceId)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
+  if (!dev) return new Response("Unknown device; not found on your TP-Link account", { status: 404 })
+  const device_id = dev.deviceId
+  const enabled = body.enabled === false ? 0 : 1
+  const efficiency = body.efficiency ?? 1
+  // alias is display-only: store the current live name as a fallback for when the
+  // device is offline/removed; reads overlay the live name on top.
   await env.DATABASE.prepare(
     `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, efficiency, enabled)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -731,10 +789,14 @@ async function handleSquidRulesPut(request, env, _ctx, params) {
        threshold_p = excluded.threshold_p, hours = excluded.hours,
        efficiency = excluded.efficiency, enabled = excluded.enabled`
   ).bind(
-    device_id, env.USER_ID, body.alias ?? null, body.strategy,
-    body.threshold_p ?? null, body.hours ?? null, body.efficiency ?? 1, body.enabled === false ? 0 : 1
+    device_id, env.USER_ID, dev.alias ?? null, body.strategy,
+    body.threshold_p ?? null, body.hours ?? null, efficiency, enabled
   ).run()
-  return Response.json({ ...body, device_id, user_id: env.USER_ID })
+  return Response.json({
+    device_id, user_id: env.USER_ID, alias: dev.alias ?? null,
+    strategy: body.strategy, threshold_p: body.threshold_p ?? null,
+    hours: body.hours ?? null, efficiency, enabled,
+  })
 }
 
 /**
@@ -837,7 +899,9 @@ async function handleSquidLog(request, env, _ctx, _params) {
      WHERE dev.user_id = ? OR dev.user_id IS NULL
      ORDER BY d.ts DESC LIMIT ?`
   ).bind(env.USER_ID, limit).all()
-  return Response.json({ results })
+  const aliasById = await liveAliasMap(env)
+  const enriched = /** @type {any[]} */ (results).map(r => ({ ...r, alias: aliasById.get(r.device_id) ?? r.alias }))
+  return Response.json({ results: enriched })
 }
 
 // --- Route table ------------------------------------------------------------
