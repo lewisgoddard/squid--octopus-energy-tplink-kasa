@@ -394,54 +394,90 @@ async function gasPriceAt(env, atISO) {
 }
 
 /**
- * Evaluates every enabled device rule against the current rate and switches as needed.
+ * Whether a rule wants its tagged devices ON at the given moment. Returns null
+ * when the rule can't be evaluated (e.g. cheaper_than_gas with no gas price).
+ * @param {Env} env
+ * @param {any} rule
+ * @param {{ time_start: string, price: string }} rate
+ * @param {string} nowISO
+ * @returns {Promise<{ on: boolean, reason: string } | null>}
+ */
+async function ruleDesired(env, rule, rate, nowISO) {
+  const label = rule.name || rule.rule_id
+  const price = parseFloat(rate.price)
+  if (rule.strategy === "cheapest_hours") {
+    const set = await cheapestStarts(env, nowISO.slice(0, 10), Math.max(1, Math.round(rule.hours * 2)))
+    const on = set.has(rate.time_start)
+    return { on, reason: `${label}: cheapest ${rule.hours}h${on ? "" : " (not now)"}` }
+  }
+  if (rule.strategy === "cheaper_than_gas") {
+    const gasPrice = await gasPriceAt(env, nowISO)
+    if (gasPrice == null) return null
+    const eff = rule.efficiency ?? 1
+    const ceiling = gasPrice * eff
+    const on = price <= ceiling
+    return { on, reason: `${label}: ${price}p ${on ? "<=" : ">"} gas ${gasPrice}p×${eff} (${ceiling.toFixed(2)}p)` }
+  }
+  const on = price <= rule.threshold_p
+  return { on, reason: `${label}: ${price}p ${on ? "<=" : ">"} ${rule.threshold_p}p` }
+}
+
+/**
+ * Evaluates enabled rules against the current rate and switches each tagged
+ * device. A device may be tagged to multiple rules; it is switched ON if ANY of
+ * its rules wants it on (any-on / OR).
  * @param {Env} env
  */
 async function evaluateDevices(env) {
   /** @type {{ results: any[] }} */
-  const { results: rules } = await env.DATABASE.prepare(
-    "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
+  const { results: pairs } = await env.DATABASE.prepare(
+    `SELECT r.rule_id, r.name, r.strategy, r.threshold_p, r.hours, r.efficiency, rd.device_id
+     FROM rules r JOIN rule_devices rd ON rd.rule_id = r.rule_id
+     WHERE r.user_id = ? AND r.enabled = 1`
   ).bind(env.USER_ID).all()
-  if (!rules.length) return []
+  if (!pairs.length) return []
 
   const nowISO = new Date().toISOString()
   const rate = await currentRate(env, nowISO)
   const liveDevices = await kasaDeviceList(env)
   const byId = new Map(liveDevices.map(d => [d.deviceId, d]))
 
-  const actions = []
-  for (const rule of rules) {
-    const dev = byId.get(rule.device_id)
-    if (!dev) { actions.push({ device_id: rule.device_id, skipped: "not found" }); continue }
-    if (dev.status !== 1) { actions.push({ device_id: rule.device_id, alias: dev.alias, skipped: "offline" }); continue }
-    if (!rate) { actions.push({ device_id: rule.device_id, alias: dev.alias, skipped: "no rate data" }); continue }
+  // Group the rules that apply to each device.
+  /** @type {Map<string, any[]>} */
+  const rulesByDevice = new Map()
+  for (const p of pairs) {
+    let list = rulesByDevice.get(p.device_id)
+    if (!list) { list = []; rulesByDevice.set(p.device_id, list) }
+    list.push(p)
+  }
 
-    const price = parseFloat(rate.price)
-    let desired, reason
-    if (rule.strategy === "cheapest_hours") {
-      const set = await cheapestStarts(env, nowISO.slice(0, 10), Math.max(1, Math.round(rule.hours * 2)))
-      desired = set.has(rate.time_start)
-      reason = `cheapest ${rule.hours}h${desired ? "" : " (not now)"}`
-    } else if (rule.strategy === "cheaper_than_gas") {
-      const gasPrice = await gasPriceAt(env, nowISO)
-      if (gasPrice == null) { actions.push({ device_id: rule.device_id, alias: dev.alias, skipped: "no gas rate" }); continue }
-      const eff = rule.efficiency ?? 1
-      const ceiling = gasPrice * eff
-      desired = price <= ceiling
-      reason = `${price}p ${desired ? "<=" : ">"} gas ${gasPrice}p×${eff} (${ceiling.toFixed(2)}p)`
-    } else { // threshold
-      desired = price <= rule.threshold_p
-      reason = `${price}p ${desired ? "<=" : ">"} ${rule.threshold_p}p`
+  const actions = []
+  for (const [deviceId, deviceRules] of rulesByDevice) {
+    const dev = byId.get(deviceId)
+    if (!dev) { actions.push({ device_id: deviceId, skipped: "not found" }); continue }
+    if (dev.status !== 1) { actions.push({ device_id: deviceId, alias: dev.alias, skipped: "offline" }); continue }
+    if (!rate) { actions.push({ device_id: deviceId, alias: dev.alias, skipped: "no rate data" }); continue }
+
+    // any-on: ON if any applicable rule wants it on.
+    let desired = false
+    const reasons = []
+    for (const rule of deviceRules) {
+      const d = await ruleDesired(env, rule, rate, nowISO)
+      if (d == null) continue
+      if (d.on) desired = true
+      reasons.push(d.reason)
     }
+    if (!reasons.length) { actions.push({ device_id: deviceId, alias: dev.alias, skipped: "no evaluable rules" }); continue }
+    const reason = `${desired ? "ON" : "OFF"} [any-on] ${reasons.join("; ")}`
 
     if ((await kasaReadState(env, dev) === 1) !== desired) {
       await kasaSetState(env, dev, desired)
       await env.DATABASE.prepare(
-        "INSERT INTO device_log (device_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?)"
-      ).bind(rule.device_id, nowISO, desired ? "on" : "off", price, reason).run()
-      actions.push({ device_id: rule.device_id, alias: dev.alias, action: desired ? "on" : "off", reason })
+        "INSERT INTO device_log (device_id, user_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(deviceId, env.USER_ID, nowISO, desired ? "on" : "off", parseFloat(rate.price), reason).run()
+      actions.push({ device_id: deviceId, alias: dev.alias, action: desired ? "on" : "off", reason })
     } else {
-      actions.push({ device_id: rule.device_id, alias: dev.alias, action: "unchanged", reason })
+      actions.push({ device_id: deviceId, alias: dev.alias, action: "unchanged", reason })
     }
   }
   return actions
@@ -673,8 +709,8 @@ async function handleKasaDeviceState(request, env, _ctx, params) {
   await kasaSetState(env, dev, body.on)
   const nowISO = new Date().toISOString()
   await env.DATABASE.prepare(
-    "INSERT INTO device_log (device_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?)"
-  ).bind(dev.deviceId, nowISO, body.on ? "on" : "off", null, "manual").run()
+    "INSERT INTO device_log (device_id, user_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
+  ).bind(dev.deviceId, env.USER_ID, nowISO, body.on ? "on" : "off", null, "manual").run()
   return Response.json({ device_id: dev.deviceId, alias: dev.alias, on: body.on })
 }
 
@@ -736,88 +772,201 @@ async function handleKasaDeviceRules(_request, env, _ctx, params) {
 }
 
 /**
- * GET /api/squid/rules — list squid device rules from DB.
+ * Validates a rule definition body. Returns an error string, or null if valid.
+ * @param {any} body
+ * @returns {string | null}
+ */
+function validateRuleBody(body) {
+  if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
+    return "strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'"
+  }
+  if (body.strategy === "threshold" && body.threshold_p == null) return "Missing threshold_p"
+  if (body.strategy === "cheapest_hours" && body.hours == null) return "Missing hours"
+  if (body.efficiency != null && !(body.efficiency > 0)) return "efficiency must be a positive number"
+  return null
+}
+
+/**
+ * Map of rule_id -> array of { device_id, alias } for the user's tagged devices,
+ * with live aliases overlaid.
+ * @param {Env} env
+ * @returns {Promise<Map<string, { device_id: string, alias: string | undefined }[]>>}
+ */
+async function ruleDeviceMap(env) {
+  const { results } = await env.DATABASE.prepare(
+    "SELECT rule_id, device_id FROM rule_devices WHERE user_id = ?"
+  ).bind(env.USER_ID).all()
+  const aliasById = await liveAliasMap(env)
+  /** @type {Map<string, { device_id: string, alias: string | undefined }[]>} */
+  const map = new Map()
+  for (const r of /** @type {{ rule_id: string, device_id: string }[]} */ (results)) {
+    if (!map.has(r.rule_id)) map.set(r.rule_id, [])
+    map.get(r.rule_id)?.push({ device_id: r.device_id, alias: aliasById.get(r.device_id) })
+  }
+  return map
+}
+
+/**
+ * GET /api/squid/rules — list rules, each with its tagged devices.
  * @param {Request} _request
  * @param {Env} env
  * @param {ExecutionContext} _ctx
  * @param {Record<string, string>} _params
  * @returns {Promise<Response>}
  */
-async function handleSquidRules(_request, env, _ctx, _params) {
-  const { results } = await env.DATABASE.prepare(
-    "SELECT device_id, alias, strategy, threshold_p, hours, efficiency, enabled FROM devices WHERE user_id = ?"
+async function handleSquidRulesList(_request, env, _ctx, _params) {
+  const { results: rules } = await env.DATABASE.prepare(
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled FROM rules WHERE user_id = ?"
   ).bind(env.USER_ID).all()
-  // Overlay the current live alias (display-only); fall back to the stored name
-  // if TP-Link is unreachable or the device is gone.
-  const aliasById = await liveAliasMap(env)
-  const enriched = /** @type {any[]} */ (results).map(r => ({ ...r, alias: aliasById.get(r.device_id) ?? r.alias }))
+  const devicesByRule = await ruleDeviceMap(env)
+  const enriched = /** @type {any[]} */ (rules).map(r => ({ ...r, devices: devicesByRule.get(r.rule_id) ?? [] }))
   return Response.json({ results: enriched })
 }
 
 /**
- * PUT /api/squid/rules/:deviceId — upsert a squid device rule.
+ * POST /api/squid/rules — create a rule. Body: { name?, strategy,
+ * threshold_p|hours|efficiency, enabled?, device_ids?: string[] }. device_ids
+ * must be canonical deviceIds; use the tag endpoint to add by alias.
  * @param {Request} request
  * @param {Env} env
  * @param {ExecutionContext} _ctx
- * @param {Record<string, string>} params
+ * @param {Record<string, string>} _params
  * @returns {Promise<Response>}
  */
-async function handleSquidRulesPut(request, env, _ctx, params) {
+async function handleSquidRuleCreate(request, env, _ctx, _params) {
   const body = await request.json()
-  if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
-    return new Response("strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'", { status: 400 })
-  }
-  if (body.strategy === "threshold" && body.threshold_p == null) return new Response("Missing threshold_p", { status: 400 })
-  if (body.strategy === "cheapest_hours" && body.hours == null) return new Response("Missing hours", { status: 400 })
-  if (body.efficiency != null && !(body.efficiency > 0)) return new Response("efficiency must be a positive number", { status: 400 })
-  // Resolve :deviceId (deviceId or alias) to a real device so rules always key
-  // on the immutable deviceId and can't be created against a non-existent device
-  // or an ambiguous name.
-  const { device: dev, ambiguous } = await resolveDevice(env, params.deviceId)
-  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
-  if (!dev) return new Response("Unknown device; not found on your TP-Link account", { status: 404 })
-  const device_id = dev.deviceId
-  const enabled = body.enabled === false ? 0 : 1
+  const err = validateRuleBody(body)
+  if (err) return new Response(err, { status: 400 })
+  const rule_id = crypto.randomUUID()
   const efficiency = body.efficiency ?? 1
-  // alias is display-only: store the current live name as a fallback for when the
-  // device is offline/removed; reads overlay the live name on top.
+  const enabled = body.enabled === false ? 0 : 1
   await env.DATABASE.prepare(
-    `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, efficiency, enabled)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(device_id) DO UPDATE SET
-       alias = excluded.alias, strategy = excluded.strategy,
-       threshold_p = excluded.threshold_p, hours = excluded.hours,
-       efficiency = excluded.efficiency, enabled = excluded.enabled`
-  ).bind(
-    device_id, env.USER_ID, dev.alias ?? null, body.strategy,
-    body.threshold_p ?? null, body.hours ?? null, efficiency, enabled
-  ).run()
+    "INSERT INTO rules (rule_id, user_id, name, strategy, threshold_p, hours, efficiency, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(rule_id, env.USER_ID, body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled).run()
+  const deviceIds = Array.isArray(body.device_ids) ? body.device_ids : []
+  for (const deviceId of deviceIds) {
+    await env.DATABASE.prepare(
+      "INSERT OR IGNORE INTO rule_devices (rule_id, device_id, user_id) VALUES (?, ?, ?)"
+    ).bind(rule_id, deviceId, env.USER_ID).run()
+  }
   return Response.json({
-    device_id, user_id: env.USER_ID, alias: dev.alias ?? null,
-    strategy: body.strategy, threshold_p: body.threshold_p ?? null,
-    hours: body.hours ?? null, efficiency, enabled,
-  })
+    rule_id, user_id: env.USER_ID, name: body.name ?? null, strategy: body.strategy,
+    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled, device_ids: deviceIds,
+  }, { status: 201 })
 }
 
 /**
- * DELETE /api/squid/rules/:deviceId — remove a squid device rule.
+ * GET /api/squid/rules/:ruleId — a single rule with its tagged devices.
  * @param {Request} _request
  * @param {Env} env
  * @param {ExecutionContext} _ctx
  * @param {Record<string, string>} params
  * @returns {Promise<Response>}
  */
-async function handleSquidRulesDelete(_request, env, _ctx, params) {
-  const { deviceId } = params
-  const result = await env.DATABASE.prepare(
-    "DELETE FROM devices WHERE user_id = ? AND device_id = ?"
-  ).bind(env.USER_ID, deviceId).run()
-  if (result.meta.changes === 0) return new Response("Not Found", { status: 404 })
-  return Response.json({ deleted: true, device_id: deviceId })
+async function handleSquidRuleGet(_request, env, _ctx, params) {
+  const rule = await env.DATABASE.prepare(
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled FROM rules WHERE user_id = ? AND rule_id = ?"
+  ).bind(env.USER_ID, params.ruleId).first()
+  if (!rule) return new Response("Not Found", { status: 404 })
+  const devicesByRule = await ruleDeviceMap(env)
+  return Response.json({ ...rule, devices: devicesByRule.get(params.ruleId) ?? [] })
 }
 
 /**
- * GET /api/squid/forecast — preview on-slots for each enabled rule.
+ * PUT /api/squid/rules/:ruleId — update a rule definition (not its device tags).
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRuleUpdate(request, env, _ctx, params) {
+  const body = await request.json()
+  const err = validateRuleBody(body)
+  if (err) return new Response(err, { status: 400 })
+  // UPDATE's change count is 0 when values are unchanged, so check existence first.
+  const exists = await env.DATABASE.prepare(
+    "SELECT 1 FROM rules WHERE user_id = ? AND rule_id = ?"
+  ).bind(env.USER_ID, params.ruleId).first()
+  if (!exists) return new Response("Not Found", { status: 404 })
+  const efficiency = body.efficiency ?? 1
+  const enabled = body.enabled === false ? 0 : 1
+  await env.DATABASE.prepare(
+    `UPDATE rules SET name = ?, strategy = ?, threshold_p = ?, hours = ?, efficiency = ?, enabled = ?
+     WHERE user_id = ? AND rule_id = ?`
+  ).bind(body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled, env.USER_ID, params.ruleId).run()
+  return Response.json({
+    rule_id: params.ruleId, user_id: env.USER_ID, name: body.name ?? null, strategy: body.strategy,
+    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled,
+  })
+}
+
+/**
+ * DELETE /api/squid/rules/:ruleId — delete a rule and all its device tags.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRuleDelete(_request, env, _ctx, params) {
+  const result = await env.DATABASE.prepare(
+    "DELETE FROM rules WHERE user_id = ? AND rule_id = ?"
+  ).bind(env.USER_ID, params.ruleId).run()
+  if (result.meta.changes === 0) return new Response("Not Found", { status: 404 })
+  await env.DATABASE.prepare(
+    "DELETE FROM rule_devices WHERE user_id = ? AND rule_id = ?"
+  ).bind(env.USER_ID, params.ruleId).run()
+  return Response.json({ deleted: true, rule_id: params.ruleId })
+}
+
+/**
+ * POST /api/squid/rules/:ruleId/devices/:id — tag a device onto a rule.
+ * :id may be a deviceId or alias; resolved to the canonical deviceId.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRuleTagDevice(_request, env, _ctx, params) {
+  const rule = await env.DATABASE.prepare(
+    "SELECT 1 FROM rules WHERE user_id = ? AND rule_id = ?"
+  ).bind(env.USER_ID, params.ruleId).first()
+  if (!rule) return new Response("Rule not found", { status: 404 })
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
+  if (!dev) return new Response("Unknown device; not found on your TP-Link account", { status: 404 })
+  await env.DATABASE.prepare(
+    "INSERT OR IGNORE INTO rule_devices (rule_id, device_id, user_id) VALUES (?, ?, ?)"
+  ).bind(params.ruleId, dev.deviceId, env.USER_ID).run()
+  return Response.json({ rule_id: params.ruleId, device_id: dev.deviceId, alias: dev.alias ?? null, tagged: true })
+}
+
+/**
+ * DELETE /api/squid/rules/:ruleId/devices/:id — untag a device from a rule
+ * (the rule itself is preserved). :id may be a deviceId or alias; falls back to
+ * the raw :id so an already-removed device can still be untagged by deviceId.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRuleUntagDevice(_request, env, _ctx, params) {
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
+  const deviceId = dev ? dev.deviceId : params.id
+  const result = await env.DATABASE.prepare(
+    "DELETE FROM rule_devices WHERE user_id = ? AND rule_id = ? AND device_id = ?"
+  ).bind(env.USER_ID, params.ruleId, deviceId).run()
+  if (result.meta.changes === 0) return new Response("Not tagged", { status: 404 })
+  return Response.json({ rule_id: params.ruleId, device_id: deviceId, untagged: true })
+}
+
+/**
+ * GET /api/squid/forecast — per-rule preview of which slots each enabled rule
+ * would fire, plus the devices it is tagged to.
  * @param {Request} request
  * @param {Env} env
  * @param {ExecutionContext} _ctx
@@ -831,8 +980,9 @@ async function handleSquidForecast(request, env, _ctx, _params) {
   const days = param ? [param] : [today, new Date(Date.now() + 86400000).toISOString().slice(0, 10)]
   /** @type {{ results: any[] }} */
   const { results: rules } = await env.DATABASE.prepare(
-    "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency FROM rules WHERE user_id = ? AND enabled = 1"
   ).bind(env.USER_ID).all()
+  const devicesByRule = await ruleDeviceMap(env)
   const results = []
   for (const rule of rules) {
     const slots = []
@@ -856,12 +1006,13 @@ async function handleSquidForecast(request, env, _ctx, _params) {
       for (const r of dayRates) if (qualifies(r)) slots.push(r)
     }
     results.push({
-      device_id: rule.device_id,
-      alias: rule.alias,
+      rule_id: rule.rule_id,
+      name: rule.name,
       strategy: rule.strategy,
       threshold_p: rule.threshold_p,
       hours: rule.hours,
       efficiency: rule.efficiency,
+      devices: devicesByRule.get(rule.rule_id) ?? [],
       on_slots: slots.length,
       on_hours: slots.length / 2,
       slots,
@@ -894,13 +1045,12 @@ async function handleSquidLog(request, env, _ctx, _params) {
   const { searchParams } = new URL(request.url)
   const limit = Math.min(parseInt(searchParams.get("limit") || "50", 10), 200)
   const { results } = await env.DATABASE.prepare(
-    `SELECT d.device_id, dev.alias, d.ts, d.action, d.price, d.reason
-     FROM device_log d LEFT JOIN devices dev ON dev.device_id = d.device_id
-     WHERE dev.user_id = ? OR dev.user_id IS NULL
-     ORDER BY d.ts DESC LIMIT ?`
+    `SELECT device_id, ts, action, price, reason FROM device_log
+     WHERE user_id = ? OR user_id IS NULL
+     ORDER BY ts DESC LIMIT ?`
   ).bind(env.USER_ID, limit).all()
   const aliasById = await liveAliasMap(env)
-  const enriched = /** @type {any[]} */ (results).map(r => ({ ...r, alias: aliasById.get(r.device_id) ?? r.alias }))
+  const enriched = /** @type {any[]} */ (results).map(r => ({ ...r, alias: aliasById.get(r.device_id) ?? null }))
   return Response.json({ results: enriched })
 }
 
@@ -927,10 +1077,14 @@ const ROUTES = [
   ["POST",   "/api/kasa/devices/:id/state",     "devices:control",handleKasaDeviceState],
   ["GET",    "/api/kasa/devices/:id/usage",     "meters:read",    handleKasaDeviceUsage],
   ["GET",    "/api/kasa/devices/:id/rules",     "devices:read",   handleKasaDeviceRules],
-  ["GET",    "/api/squid/rules",                "rules:read",     handleSquidRules],
-  ["PUT",    "/api/squid/rules/:deviceId",      "rules:write",    handleSquidRulesPut],
-  ["DELETE", "/api/squid/rules/:deviceId",      "rules:write",    handleSquidRulesDelete],
-  ["GET",    "/api/squid/forecast",             "rules:read",     handleSquidForecast],
+  ["GET",    "/api/squid/rules",                     "rules:read",     handleSquidRulesList],
+  ["POST",   "/api/squid/rules",                     "rules:write",    handleSquidRuleCreate],
+  ["GET",    "/api/squid/rules/:ruleId",             "rules:read",     handleSquidRuleGet],
+  ["PUT",    "/api/squid/rules/:ruleId",             "rules:write",    handleSquidRuleUpdate],
+  ["DELETE", "/api/squid/rules/:ruleId",             "rules:write",    handleSquidRuleDelete],
+  ["POST",   "/api/squid/rules/:ruleId/devices/:id", "rules:write",    handleSquidRuleTagDevice],
+  ["DELETE", "/api/squid/rules/:ruleId/devices/:id", "rules:write",    handleSquidRuleUntagDevice],
+  ["GET",    "/api/squid/forecast",                  "rules:read",     handleSquidForecast],
   ["POST",   "/api/squid/evaluate",             "devices:control",handleSquidEvaluate],
   ["GET",    "/api/squid/log",                  "logs:read",      handleSquidLog],
 ]

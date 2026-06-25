@@ -58,17 +58,10 @@ Update `wrangler.toml` with your D1 `database_id`:
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [devices] (device_id text PRIMARY KEY, user_id text, alias text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, ts text, action text, price real, reason text)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
-   ```
-
-   Upgrading an existing database (adds the columns/table backing the `cheaper_than_gas` strategy):
-   ```bash
-   npx wrangler d1 execute kraken-db --remote --command "ALTER TABLE [devices] ADD COLUMN efficiency real DEFAULT 1"
-   npx wrangler d1 execute kraken-db --remote --command "ALTER TABLE [tariffs] ADD COLUMN gas_tariff_code text"
-   npx wrangler d1 execute kraken-db --remote --command "ALTER TABLE [tariffs] ADD COLUMN gas_price_p real"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    ```
 
 If you prefer to create the table in console, then use the following command:
@@ -98,10 +91,13 @@ CREATE TABLE IF NOT EXISTS [tariffs] (
     gas_price_p real               -- manual gas unit-rate override (pence/kWh); NULL = use fetched gas rate
 );
 
-CREATE TABLE IF NOT EXISTS [devices] (
-    device_id   text PRIMARY KEY,  -- TP-Link cloud deviceId
+-- A rule is the automation definition; rule_devices tags devices onto it.
+-- Many devices per rule, and many rules per device (a device is ON if ANY of
+-- its rules wants it on).
+CREATE TABLE IF NOT EXISTS [rules] (
+    rule_id     text PRIMARY KEY,  -- generated UUID (migrated rules reuse the old device_id)
     user_id     text,
-    alias       text,
+    name        text,              -- display label for the rule
     strategy    text,              -- 'threshold' | 'cheapest_hours' | 'cheaper_than_gas'
     threshold_p real,              -- for 'threshold': switch on at/below this price (pence)
     hours       real,              -- for 'cheapest_hours': keep on during the cheapest N hours of the day
@@ -109,9 +105,17 @@ CREATE TABLE IF NOT EXISTS [devices] (
     enabled     integer DEFAULT 1
 );
 
+CREATE TABLE IF NOT EXISTS [rule_devices] (
+    rule_id   text,
+    device_id text,                -- TP-Link cloud deviceId
+    user_id   text,
+    PRIMARY KEY (rule_id, device_id)
+);
+
 CREATE TABLE IF NOT EXISTS [device_log] (
     id          integer PRIMARY KEY AUTOINCREMENT,
     device_id   text,
+    user_id     text,
     ts          text,
     action      text,              -- 'on' | 'off'
     price       real,
@@ -167,8 +171,9 @@ Create the table in the local D1 database (stored in `.wrangler/`):
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
-npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [devices] (device_id text PRIMARY KEY, user_id text, alias text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
-npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, ts text, action text, price real, reason text)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
 ```
 
@@ -215,10 +220,14 @@ All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/squid/rules` | Lists all Squid rate-based automation rules from D1. |
-| `PUT` | `/api/squid/rules/:deviceId` | Creates or updates a rule for a device. `:deviceId` is the TP-Link `device_id`. Body: `{"alias","strategy","threshold_p"\|"hours"\|"efficiency","enabled"}`. See [Kasa device control](#kasa-device-control). |
-| `DELETE` | `/api/squid/rules/:deviceId` | Deletes the rule for a device. |
-| `GET` | `/api/squid/forecast` | Read-only preview of which half-hour slots each enabled rule would switch its device **on**, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. Each result includes `on_slots`, `on_hours` and the qualifying `slots` (with prices). |
+| `GET` | `/api/squid/rules` | Lists all rate-based automation rules, each with its tagged `devices`. |
+| `POST` | `/api/squid/rules` | Creates a rule. Body: `{"name?","strategy","threshold_p"\|"hours"\|"efficiency","enabled?","device_ids?":[...]}`. Returns the generated `rule_id`. `device_ids` must be canonical deviceIds; use the tag endpoint to add by alias. |
+| `GET` | `/api/squid/rules/:ruleId` | Returns one rule with its tagged devices. |
+| `PUT` | `/api/squid/rules/:ruleId` | Updates a rule's definition (not its device tags). |
+| `DELETE` | `/api/squid/rules/:ruleId` | Deletes a rule and all its device tags. |
+| `POST` | `/api/squid/rules/:ruleId/devices/:id` | **Tags** a device onto the rule (`:id` = deviceId or alias). |
+| `DELETE` | `/api/squid/rules/:ruleId/devices/:id` | **Untags** a device from the rule, leaving the rule intact. |
+| `GET` | `/api/squid/forecast` | Read-only preview of which half-hour slots each enabled rule would fire, plus the `devices` it is tagged to, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. Each result includes `on_slots`, `on_hours` and the qualifying `slots`. |
 | `POST` | `/api/squid/evaluate` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. |
 | `GET` | `/api/squid/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). |
 
@@ -288,8 +297,11 @@ The API is split into two domains: `kasa/` proxies the TP-Link hardware
 on-device firmware rules), while `squid/` holds the rate-based automation
 (rules, forecast, evaluate, and switching log).
 
-Each device is controlled by a Squid rule stored in the `devices` table. Three
-strategies are supported:
+Automation is defined by **rules** (the `rules` table). Devices are **tagged**
+onto a rule (`rule_devices`) — a rule can drive **many devices**, and a device
+can belong to **many rules**. When a device is tagged to several rules it is
+switched **on if _any_ of them wants it on** (any-on). Three strategies are
+supported:
 
 | Strategy | Fields | Behaviour |
 |----------|--------|-----------|
@@ -299,40 +311,47 @@ strategies are supported:
 
 #### Setup
 
-1. Find your devices and their `device_id`s (the response also shows each
-   device's online `status` and current `on` relay state):
+1. Find your devices (the response shows each device's `device_id`, online
+   `status` and current `on` relay state):
    ```bash
    curl -H "Authorization: Bearer $SQUID_API_KEY" \
      https://<worker>/api/kasa/devices
    # {"results":[{"device_id":"80...","alias":"Smart Plug","model":"KP115(UK)","status":1,"on":true}]}
    ```
-2. Create a Squid rule for a device (`:deviceId` is the `device_id` from step 1):
+2. Create a rule (returns a generated `rule_id`). You can tag devices up front
+   with `device_ids`, or leave it empty and tag them later:
    ```bash
-   # Turn a plug on whenever the price is 15p or cheaper
-   curl -X PUT -H "Authorization: Bearer $SQUID_API_KEY" \
-     -d '{"alias":"Dehumidifier","strategy":"threshold","threshold_p":15}' \
-     https://<worker>/api/squid/rules/80...
+   # On whenever the price is 15p or cheaper, applied to one plug
+   curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+     -d '{"name":"Cheap power","strategy":"threshold","threshold_p":15,"device_ids":["80..."]}' \
+     https://<worker>/api/squid/rules
+   # -> {"rule_id":"f2b4edd5-...", ...}
 
-   # Keep a plug on during the cheapest 4 hours of the day
-   curl -X PUT -H "Authorization: Bearer $SQUID_API_KEY" \
-     -d '{"alias":"Battery","strategy":"cheapest_hours","hours":4}' \
-     https://<worker>/api/squid/rules/81...
-
-   # Run a heat pump (COP 3 vs a 90% boiler) only when electricity beats gas
-   curl -X PUT -H "Authorization: Bearer $SQUID_API_KEY" \
-     -d '{"alias":"Heat pump","strategy":"cheaper_than_gas","efficiency":3.3}' \
-     https://<worker>/api/squid/rules/82...
+   # Run heat pumps (COP 3 vs a 90% boiler) only when electricity beats gas
+   curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+     -d '{"name":"Heat pumps","strategy":"cheaper_than_gas","efficiency":3.3}' \
+     https://<worker>/api/squid/rules
    ```
    The gas price comes from your Octopus gas tariff automatically. If you're not
    on an Octopus gas tariff, set a manual rate: `PUT /api/octopus/tariff` with
    `{"gas_price_p": 6.5}`.
-3. The `0,30 * * * *` cron evaluates every enabled rule each half hour. You can
+3. Tag or untag devices on a rule at any time (without deleting the rule).
+   `:id` may be a `device_id` or a (unique) alias:
+   ```bash
+   # Tag a device onto the rule
+   curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+     https://<worker>/api/squid/rules/f2b4edd5-.../devices/82...
+   # Untag it again (rule stays)
+   curl -X DELETE -H "Authorization: Bearer $SQUID_API_KEY" \
+     https://<worker>/api/squid/rules/f2b4edd5-.../devices/82...
+   ```
+4. The `0,30 * * * *` cron evaluates every enabled rule each half hour. You can
    also trigger it manually:
    ```bash
    curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
      https://<worker>/api/squid/evaluate
    ```
-4. Preview which slots each rule will switch on (read-only, from cached rates):
+5. Preview which slots each rule will fire (read-only, from cached rates):
    ```bash
    curl -H "Authorization: Bearer $SQUID_API_KEY" \
      https://<worker>/api/squid/forecast            # today + tomorrow (UTC)
@@ -342,8 +361,9 @@ strategies are supported:
 
 A device's relay state is read before each switch, so the worker only sends a
 command (and writes a `device_log` row) when the state actually needs to change.
-Set `"enabled": false` on a rule to leave a device alone without deleting it.
-To remove a rule entirely: `DELETE /api/squid/rules/:deviceId`.
+Set `"enabled": false` on a rule to pause it without deleting it. To remove a
+rule entirely: `DELETE /api/squid/rules/:ruleId` (its device tags are removed
+too; the devices themselves are untouched).
 
 #### Manual device control
 
