@@ -157,14 +157,6 @@ async function updateRates(env) {
   return results
 }
 
-/**
- * @param {Request} request
- * @param {Env} env
- */
-function authorized(request, env) {
-  return request.headers.get("Authorization") === `Bearer ${env.OCTOPUS_API_KEY}`
-}
-
 // --- TP-Link Kasa cloud control ---------------------------------------------
 
 /**
@@ -415,6 +407,494 @@ async function evaluateDevices(env) {
   return actions
 }
 
+// --- Auth -------------------------------------------------------------------
+
+/**
+ * Returns true iff the request carries the SQUID_API_KEY bearer token.
+ * The `permission` parameter is reserved for future RBAC; currently the single
+ * key satisfies all permissions.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {string} permission
+ * @returns {boolean}
+ */
+function hasPermission(request, env, permission) {
+  return request.headers.get("Authorization") === `Bearer ${env.SQUID_API_KEY}`
+}
+
+// --- Route handlers ---------------------------------------------------------
+
+/**
+ * GET /api/octopus/rates — paginated cached rates.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleOctopusRates(request, env, _ctx, _params) {
+  const { searchParams } = new URL(request.url)
+  const limit = Math.min(parseInt(searchParams.get("limit") || "96", 10), 96)
+  const page = Math.max(parseInt(searchParams.get("page") || "1", 10), 1)
+  const offset = (page - 1) * limit
+  const from = searchParams.get("from")
+  const to = searchParams.get("to")
+  let where = "WHERE user_id = ?"
+  const filterBindings = [env.USER_ID]
+  if (from) { where += " AND time_start >= ?"; filterBindings.push(from) }
+  if (to)   { where += " AND time_start <= ?"; filterBindings.push(to) }
+  const [countRow, { results }] = await Promise.all([
+    env.DATABASE.prepare(`SELECT COUNT(*) as count FROM rates ${where}`).bind(...filterBindings).first(),
+    env.DATABASE.prepare(`SELECT time_start, time_end, price FROM rates ${where} ORDER BY time_start DESC LIMIT ? OFFSET ?`).bind(...filterBindings, limit, offset).all()
+  ])
+  const count = /** @type {number} */ (countRow?.count ?? 0)
+  /** @param {number} p */
+  const pageURL = (p) => { const u = new URL(request.url); u.searchParams.set("page", String(p)); u.searchParams.set("limit", String(limit)); return u.toString() }
+  return Response.json({
+    count,
+    next: offset + limit < count ? pageURL(page + 1) : null,
+    previous: page > 1 ? pageURL(page - 1) : null,
+    results
+  })
+}
+
+/**
+ * GET /api/octopus/rates/live — live rates from Octopus API.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleOctopusRatesLive(request, env, _ctx, _params) {
+  const data = await fetchOctopusRates(env)
+  const base = new URL(request.url)
+  /** @param {string} u */
+  const rewrite = u => { const r = new URL(base); new URL(u).searchParams.forEach((v, k) => r.searchParams.set(k, v)); return r.toString() }
+  return Response.json({
+    count: data.count,
+    next: data.next ? rewrite(data.next) : null,
+    previous: data.previous ? rewrite(data.previous) : null,
+    results: data.results
+  })
+}
+
+/**
+ * POST /api/octopus/rates/refresh — pull latest rates from Octopus and store.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleOctopusRatesRefresh(_request, env, _ctx, _params) {
+  const rates = await updateRates(env)
+  return Response.json(rates)
+}
+
+/**
+ * GET /api/octopus/tariff — read stored tariff codes.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleOctopusTariffGet(_request, env, _ctx, _params) {
+  const row = await env.DATABASE.prepare(
+    "SELECT tariff_code, gas_tariff_code, gas_price_p FROM tariffs WHERE user_id = ?"
+  ).bind(env.USER_ID).first()
+  if (!row) return new Response("Not Found", { status: 404 })
+  return Response.json({
+    user_id: env.USER_ID,
+    tariff_code: row.tariff_code,
+    gas_tariff_code: row.gas_tariff_code,
+    gas_price_p: row.gas_price_p,
+  })
+}
+
+/**
+ * PUT /api/octopus/tariff — set tariff code and/or manual gas price override.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleOctopusTariffPut(request, env, _ctx, _params) {
+  const { tariff_code, gas_price_p } = await request.json()
+  if (tariff_code == null && gas_price_p === undefined) {
+    return new Response("Missing tariff_code or gas_price_p", { status: 400 })
+  }
+  if (tariff_code != null) {
+    await env.DATABASE.prepare(
+      "INSERT INTO tariffs (user_id, tariff_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tariff_code = excluded.tariff_code"
+    ).bind(env.USER_ID, tariff_code).run()
+  }
+  // gas_price_p is the manual override; pass null to clear it and fall back
+  // to the auto-fetched gas rate.
+  if (gas_price_p !== undefined) {
+    await env.DATABASE.prepare(
+      "INSERT INTO tariffs (user_id, gas_price_p) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET gas_price_p = excluded.gas_price_p"
+    ).bind(env.USER_ID, gas_price_p).run()
+  }
+  return Response.json({
+    user_id: env.USER_ID,
+    ...(tariff_code != null ? { tariff_code } : {}),
+    ...(gas_price_p !== undefined ? { gas_price_p } : {}),
+  })
+}
+
+/**
+ * GET /api/octopus/meters/:fuel — meter consumption (electricity or gas).
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleOctopusMeters(request, env, _ctx, params) {
+  const { fuel } = params
+  if (fuel === "electricity") {
+    const url = `https://api.octopus.energy/v1/electricity-meter-points/${env.ELECTRICITY_MPAN}/meters/${env.ELECTRICITY_SERIAL}/consumption/`
+    return fetchOctopusMeter(url, env, request.url)
+  }
+  if (fuel === "gas") {
+    const url = `https://api.octopus.energy/v1/gas-meter-points/${env.GAS_MPRN}/meters/${env.GAS_SERIAL}/consumption/`
+    return fetchOctopusMeter(url, env, request.url)
+  }
+  return new Response("fuel must be 'electricity' or 'gas'", { status: 400 })
+}
+
+/**
+ * GET /api/kasa/devices — live device list from TP-Link cloud.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDevices(_request, env, _ctx, _params) {
+  const devices = await kasaDeviceList(env)
+  const results = await Promise.all(devices.map(async d => ({
+    device_id: d.deviceId,
+    alias: d.alias,
+    model: d.deviceModel,
+    status: d.status,
+    // Relay state requires a per-device passthrough; only reachable when online.
+    // null = unknown (offline or read failed).
+    on: d.status === 1
+      ? await kasaReadState(env, d).then(s => s === 1).catch(() => null)
+      : null,
+  })))
+  return Response.json({ results })
+}
+
+/**
+ * GET /api/kasa/devices/:id — single live device by deviceId or alias.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDevice(_request, env, _ctx, params) {
+  const dev = await findKasaDevice(env, params.id)
+  if (!dev) return new Response("Not Found", { status: 404 })
+  return Response.json({
+    device_id: dev.deviceId,
+    alias: dev.alias,
+    model: dev.deviceModel,
+    status: dev.status,
+    on: dev.status === 1
+      ? await kasaReadState(env, dev).then(s => s === 1).catch(() => null)
+      : null,
+  })
+}
+
+/**
+ * POST /api/kasa/devices/:id/state — turn a device on or off.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDeviceState(request, env, _ctx, params) {
+  const body = await request.json()
+  if (typeof body.on !== "boolean") {
+    return new Response("Body must include 'on' as a boolean", { status: 400 })
+  }
+  const dev = await findKasaDevice(env, params.id)
+  if (!dev) return new Response("Not Found", { status: 404 })
+  if (dev.status !== 1) return new Response("Device offline", { status: 409 })
+  await kasaSetState(env, dev, body.on)
+  const nowISO = new Date().toISOString()
+  await env.DATABASE.prepare(
+    "INSERT INTO device_log (device_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?)"
+  ).bind(dev.deviceId, nowISO, body.on ? "on" : "off", null, "manual").run()
+  return Response.json({ device_id: dev.deviceId, alias: dev.alias, on: body.on })
+}
+
+/**
+ * GET /api/kasa/devices/:id/usage — emeter energy data for a device.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDeviceUsage(request, env, _ctx, params) {
+  const { searchParams } = new URL(request.url)
+  const kind = /** @type {"realtime" | "day" | "month"} */ (searchParams.get("kind") || "realtime")
+  if (!["realtime", "day", "month"].includes(kind)) {
+    return new Response("kind must be 'realtime', 'day' or 'month'", { status: 400 })
+  }
+  const now = new Date()
+  const year = parseInt(searchParams.get("year") || String(now.getUTCFullYear()), 10)
+  const month = parseInt(searchParams.get("month") || String(now.getUTCMonth() + 1), 10)
+  const dev = await findKasaDevice(env, params.id)
+  if (!dev) return new Response("Not Found", { status: 404 })
+  if (dev.status !== 1) return new Response("Device offline", { status: 409 })
+  return Response.json({
+    device_id: dev.deviceId,
+    alias: dev.alias,
+    kind,
+    ...(kind === "day" ? { year, month } : kind === "month" ? { year } : {}),
+    results: await kasaUsage(env, dev, kind, year, month),
+  })
+}
+
+/**
+ * GET /api/kasa/devices/:id/rules — firmware schedule/countdown/anti-theft rules.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDeviceRules(_request, env, _ctx, params) {
+  const dev = await findKasaDevice(env, params.id)
+  if (!dev) return new Response("Not Found", { status: 404 })
+  if (dev.status !== 1) return new Response("Device offline", { status: 409 })
+  const [scheduleData, countDownData, antiTheftData] = await Promise.all([
+    kasaPassthrough(env, dev, { schedule: { get_rules: {} } }),
+    kasaPassthrough(env, dev, { count_down: { get_rules: {} } }),
+    kasaPassthrough(env, dev, { anti_theft: { get_rules: {} } }),
+  ])
+  return Response.json({
+    device_id: dev.deviceId,
+    alias: dev.alias,
+    schedule: scheduleData?.schedule?.get_rules?.rule_list ?? [],
+    count_down: countDownData?.count_down?.get_rules?.rule_list ?? [],
+    anti_theft: antiTheftData?.anti_theft?.get_rules?.rule_list ?? [],
+  })
+}
+
+/**
+ * GET /api/squid/rules — list squid device rules from DB.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRules(_request, env, _ctx, _params) {
+  const { results } = await env.DATABASE.prepare(
+    "SELECT device_id, alias, strategy, threshold_p, hours, efficiency, enabled FROM devices WHERE user_id = ?"
+  ).bind(env.USER_ID).all()
+  return Response.json({ results })
+}
+
+/**
+ * PUT /api/squid/rules/:deviceId — upsert a squid device rule.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRulesPut(request, env, _ctx, params) {
+  const body = await request.json()
+  const device_id = params.deviceId
+  if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
+    return new Response("strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'", { status: 400 })
+  }
+  if (body.strategy === "threshold" && body.threshold_p == null) return new Response("Missing threshold_p", { status: 400 })
+  if (body.strategy === "cheapest_hours" && body.hours == null) return new Response("Missing hours", { status: 400 })
+  if (body.efficiency != null && !(body.efficiency > 0)) return new Response("efficiency must be a positive number", { status: 400 })
+  await env.DATABASE.prepare(
+    `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, efficiency, enabled)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(device_id) DO UPDATE SET
+       alias = excluded.alias, strategy = excluded.strategy,
+       threshold_p = excluded.threshold_p, hours = excluded.hours,
+       efficiency = excluded.efficiency, enabled = excluded.enabled`
+  ).bind(
+    device_id, env.USER_ID, body.alias ?? null, body.strategy,
+    body.threshold_p ?? null, body.hours ?? null, body.efficiency ?? 1, body.enabled === false ? 0 : 1
+  ).run()
+  return Response.json({ ...body, device_id, user_id: env.USER_ID })
+}
+
+/**
+ * DELETE /api/squid/rules/:deviceId — remove a squid device rule.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidRulesDelete(_request, env, _ctx, params) {
+  const { deviceId } = params
+  const result = await env.DATABASE.prepare(
+    "DELETE FROM devices WHERE user_id = ? AND device_id = ?"
+  ).bind(env.USER_ID, deviceId).run()
+  if (result.meta.changes === 0) return new Response("Not Found", { status: 404 })
+  return Response.json({ deleted: true, device_id: deviceId })
+}
+
+/**
+ * GET /api/squid/forecast — preview on-slots for each enabled rule.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidForecast(request, env, _ctx, _params) {
+  const { searchParams } = new URL(request.url)
+  const today = new Date().toISOString().slice(0, 10)
+  const param = searchParams.get("date")
+  const days = param ? [param] : [today, new Date(Date.now() + 86400000).toISOString().slice(0, 10)]
+  /** @type {{ results: any[] }} */
+  const { results: rules } = await env.DATABASE.prepare(
+    "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
+  ).bind(env.USER_ID).all()
+  const results = []
+  for (const rule of rules) {
+    const slots = []
+    for (const day of days) {
+      /** @type {{ results: { time_start: string, time_end: string, price: string }[] }} */
+      const { results: dayRates } = await env.DATABASE.prepare(
+        "SELECT time_start, time_end, price FROM rates WHERE user_id = ? AND time_start >= ? AND time_start < ? ORDER BY time_start ASC"
+      ).bind(env.USER_ID, `${day}T00:00:00Z`, `${day}T24:00:00Z`).all()
+      let qualifies
+      if (rule.strategy === "cheapest_hours") {
+        const set = await cheapestStarts(env, day, Math.max(1, Math.round(rule.hours * 2)))
+        qualifies = (/** @type {{ time_start: string }} */ r) => set.has(r.time_start)
+      } else if (rule.strategy === "cheaper_than_gas") {
+        // Gas is typically a flat daily rate; take one price for the day (noon).
+        const gasPrice = await gasPriceAt(env, `${day}T12:00:00Z`)
+        const ceiling = gasPrice == null ? -Infinity : gasPrice * (rule.efficiency ?? 1)
+        qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= ceiling
+      } else {
+        qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= rule.threshold_p
+      }
+      for (const r of dayRates) if (qualifies(r)) slots.push(r)
+    }
+    results.push({
+      device_id: rule.device_id,
+      alias: rule.alias,
+      strategy: rule.strategy,
+      threshold_p: rule.threshold_p,
+      hours: rule.hours,
+      efficiency: rule.efficiency,
+      on_slots: slots.length,
+      on_hours: slots.length / 2,
+      slots,
+    })
+  }
+  return Response.json({ days, results })
+}
+
+/**
+ * POST /api/squid/evaluate — run evaluateDevices now.
+ * @param {Request} _request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidEvaluate(_request, env, _ctx, _params) {
+  return Response.json({ results: await evaluateDevices(env) })
+}
+
+/**
+ * GET /api/squid/log — recent device_log entries.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} _params
+ * @returns {Promise<Response>}
+ */
+async function handleSquidLog(request, env, _ctx, _params) {
+  const { searchParams } = new URL(request.url)
+  const limit = Math.min(parseInt(searchParams.get("limit") || "50", 10), 200)
+  const { results } = await env.DATABASE.prepare(
+    `SELECT d.device_id, dev.alias, d.ts, d.action, d.price, d.reason
+     FROM device_log d LEFT JOIN devices dev ON dev.device_id = d.device_id
+     WHERE dev.user_id = ? OR dev.user_id IS NULL
+     ORDER BY d.ts DESC LIMIT ?`
+  ).bind(env.USER_ID, limit).all()
+  return Response.json({ results })
+}
+
+// --- Route table ------------------------------------------------------------
+
+/**
+ * @typedef {(request: Request, env: Env, ctx: ExecutionContext, params: Record<string, string>) => Promise<Response>} RouteHandler
+ */
+
+/**
+ * [METHOD, PATTERN, PERMISSION, handler]
+ * PATTERN segments starting with ':' are captured as named params.
+ * @type {[string, string, string, RouteHandler][]}
+ */
+const ROUTES = [
+  ["GET",    "/api/octopus/rates",              "rates:read",     handleOctopusRates],
+  ["GET",    "/api/octopus/rates/live",         "rates:read",     handleOctopusRatesLive],
+  ["POST",   "/api/octopus/rates/refresh",      "rates:manage",   handleOctopusRatesRefresh],
+  ["GET",    "/api/octopus/tariff",             "rates:read",     handleOctopusTariffGet],
+  ["PUT",    "/api/octopus/tariff",             "rates:manage",   handleOctopusTariffPut],
+  ["GET",    "/api/octopus/meters/:fuel",       "meters:read",    handleOctopusMeters],
+  ["GET",    "/api/kasa/devices",               "devices:read",   handleKasaDevices],
+  ["GET",    "/api/kasa/devices/:id",           "devices:read",   handleKasaDevice],
+  ["POST",   "/api/kasa/devices/:id/state",     "devices:control",handleKasaDeviceState],
+  ["GET",    "/api/kasa/devices/:id/usage",     "meters:read",    handleKasaDeviceUsage],
+  ["GET",    "/api/kasa/devices/:id/rules",     "devices:read",   handleKasaDeviceRules],
+  ["GET",    "/api/squid/rules",                "rules:read",     handleSquidRules],
+  ["PUT",    "/api/squid/rules/:deviceId",      "rules:write",    handleSquidRulesPut],
+  ["DELETE", "/api/squid/rules/:deviceId",      "rules:write",    handleSquidRulesDelete],
+  ["GET",    "/api/squid/forecast",             "rules:read",     handleSquidForecast],
+  ["POST",   "/api/squid/evaluate",             "devices:control",handleSquidEvaluate],
+  ["GET",    "/api/squid/log",                  "logs:read",      handleSquidLog],
+]
+
+/**
+ * Match `pathname` against a route PATTERN.
+ * Returns the captured params object on match, or null on mismatch.
+ * @param {string} pattern
+ * @param {string} pathname
+ * @returns {Record<string, string> | null}
+ */
+function matchRoute(pattern, pathname) {
+  const patSegs = pattern.split("/")
+  const urlSegs = pathname.split("/")
+  if (patSegs.length !== urlSegs.length) return null
+  /** @type {Record<string, string>} */
+  const params = {}
+  for (let i = 0; i < patSegs.length; i++) {
+    const p = patSegs[i]
+    if (p.startsWith(":")) {
+      params[p.slice(1)] = urlSegs[i]
+    } else if (p !== urlSegs[i]) {
+      return null
+    }
+  }
+  return params
+}
+
 /** @type {ExportedHandler<Env>} */
 export default {
   async scheduled(event, env, ctx) {
@@ -426,253 +906,48 @@ export default {
   },
 
   async fetch(request, env, ctx) {
-    const { pathname, searchParams } = new URL(request.url)
+    const { pathname } = new URL(request.url)
 
     try {
-      if (pathname === "/api/octopus/rates/update") {
-        const auth = request.headers.get("Authorization")
-        if (auth !== `Bearer ${env.OCTOPUS_API_KEY}`) {
-          return new Response("Unauthorized", { status: 401 })
-        }
-        const rates = await updateRates(env)
-        return Response.json(rates)
+      // Root help text (public, no auth)
+      if (pathname === "/") {
+        return new Response(
+          "Hi! GET /api/octopus/rates for cached electricity rates, " +
+          "/api/octopus/rates/live for live rates, " +
+          "/api/kasa/devices for device list."
+        )
       }
 
-      if (pathname === "/api/octopus/tariff" && request.method === "PUT") {
-        const auth = request.headers.get("Authorization")
-        if (auth !== `Bearer ${env.OCTOPUS_API_KEY}`) {
-          return new Response("Unauthorized", { status: 401 })
-        }
-        const { tariff_code, gas_price_p } = await request.json()
-        if (tariff_code == null && gas_price_p === undefined) {
-          return new Response("Missing tariff_code or gas_price_p", { status: 400 })
-        }
-        if (tariff_code != null) {
-          await env.DATABASE.prepare(
-            "INSERT INTO tariffs (user_id, tariff_code) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tariff_code = excluded.tariff_code"
-          ).bind(env.USER_ID, tariff_code).run()
-        }
-        // gas_price_p is the manual override; pass null to clear it and fall back
-        // to the auto-fetched gas rate.
-        if (gas_price_p !== undefined) {
-          await env.DATABASE.prepare(
-            "INSERT INTO tariffs (user_id, gas_price_p) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET gas_price_p = excluded.gas_price_p"
-          ).bind(env.USER_ID, gas_price_p).run()
-        }
-        return Response.json({
-          user_id: env.USER_ID,
-          ...(tariff_code != null ? { tariff_code } : {}),
-          ...(gas_price_p !== undefined ? { gas_price_p } : {}),
-        })
+      // Find matching routes by path
+      /** @type {{ route: [string, string, string, RouteHandler], params: Record<string, string> }[]} */
+      const pathMatches = []
+      for (const route of ROUTES) {
+        const params = matchRoute(route[1], pathname)
+        if (params !== null) pathMatches.push({ route, params })
       }
 
-      if (pathname === "/api/octopus/tariff" && request.method === "GET") {
-        const auth = request.headers.get("Authorization")
-        if (auth !== `Bearer ${env.OCTOPUS_API_KEY}`) {
-          return new Response("Unauthorized", { status: 401 })
-        }
-        const row = await env.DATABASE.prepare(
-          "SELECT tariff_code, gas_tariff_code, gas_price_p FROM tariffs WHERE user_id = ?"
-        ).bind(env.USER_ID).first()
-        if (!row) return new Response("Not Found", { status: 404 })
-        return Response.json({
-          user_id: env.USER_ID,
-          tariff_code: row.tariff_code,
-          gas_tariff_code: row.gas_tariff_code,
-          gas_price_p: row.gas_price_p,
-        })
+      if (pathMatches.length === 0) {
+        return new Response("Not Found", { status: 404 })
       }
 
-      if (pathname === "/api/octopus/rates/cache") {
-        const params = searchParams
-        const limit = Math.min(parseInt(params.get("limit") || "96", 10), 96)
-        const page = Math.max(parseInt(params.get("page") || "1", 10), 1)
-        const offset = (page - 1) * limit
-        const from = params.get("from")
-        const to = params.get("to")
-        let where = "WHERE user_id = ?"
-        const filterBindings = [env.USER_ID]
-        if (from) { where += " AND time_start >= ?"; filterBindings.push(from) }
-        if (to)   { where += " AND time_start <= ?"; filterBindings.push(to) }
-        const [countRow, { results }] = await Promise.all([
-          env.DATABASE.prepare(`SELECT COUNT(*) as count FROM rates ${where}`).bind(...filterBindings).first(),
-          env.DATABASE.prepare(`SELECT time_start, time_end, price FROM rates ${where} ORDER BY time_start DESC LIMIT ? OFFSET ?`).bind(...filterBindings, limit, offset).all()
-        ])
-        const count = /** @type {number} */ (countRow?.count ?? 0)
-        /** @param {number} p */
-        const pageURL = (p) => { const u = new URL(request.url); u.searchParams.set("page", String(p)); u.searchParams.set("limit", String(limit)); return u.toString() }
-        return Response.json({
-          count,
-          next: offset + limit < count ? pageURL(page + 1) : null,
-          previous: page > 1 ? pageURL(page - 1) : null,
-          results
-        });
+      // Check method
+      const methodMatch = pathMatches.find(m => m.route[0] === request.method)
+      if (!methodMatch) {
+        return new Response("Method Not Allowed", { status: 405 })
       }
 
-      if ( pathname == "/api/octopus/rates/live" ) {
-        const data = await fetchOctopusRates(env)
-        const base = new URL(request.url)
-        /** @param {string} u */
-        const rewrite = u => { const r = new URL(base); new URL(u).searchParams.forEach((v, k) => r.searchParams.set(k, v)); return r.toString() }
-        return Response.json({
-          count: data.count,
-          next: data.next ? rewrite(data.next) : null,
-          previous: data.previous ? rewrite(data.previous) : null,
-          results: data.results
-        })
+      const { route, params } = methodMatch
+      const [, , permission, handler] = route
+
+      // Auth gate
+      if (!hasPermission(request, env, permission)) {
+        return new Response("Unauthorized", { status: 401 })
       }
 
-      if ( pathname == "/api/octopus/meters/electricity" ) {
-        const url = `https://api.octopus.energy/v1/electricity-meter-points/${env.ELECTRICITY_MPAN}/meters/${env.ELECTRICITY_SERIAL}/consumption/`
-        return fetchOctopusMeter(url, env, request.url)
-      }
-
-      if ( pathname == "/api/octopus/meters/gas" ) {
-        const url = `https://api.octopus.energy/v1/gas-meter-points/${env.GAS_MPRN}/meters/${env.GAS_SERIAL}/consumption/`
-        return fetchOctopusMeter(url, env, request.url)
-      }
-
-      if (pathname === "/api/kasa/devices" && request.method === "GET") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        const { results } = await env.DATABASE.prepare(
-          "SELECT device_id, alias, strategy, threshold_p, hours, efficiency, enabled FROM devices WHERE user_id = ?"
-        ).bind(env.USER_ID).all()
-        return Response.json({ results })
-      }
-
-      if (pathname === "/api/kasa/devices" && request.method === "PUT") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        const body = await request.json()
-        if (!body.device_id) return new Response("Missing device_id", { status: 400 })
-        if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
-          return new Response("strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'", { status: 400 })
-        }
-        if (body.strategy === "threshold" && body.threshold_p == null) return new Response("Missing threshold_p", { status: 400 })
-        if (body.strategy === "cheapest_hours" && body.hours == null) return new Response("Missing hours", { status: 400 })
-        if (body.efficiency != null && !(body.efficiency > 0)) return new Response("efficiency must be a positive number", { status: 400 })
-        await env.DATABASE.prepare(
-          `INSERT INTO devices (device_id, user_id, alias, strategy, threshold_p, hours, efficiency, enabled)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(device_id) DO UPDATE SET
-             alias = excluded.alias, strategy = excluded.strategy,
-             threshold_p = excluded.threshold_p, hours = excluded.hours,
-             efficiency = excluded.efficiency, enabled = excluded.enabled`
-        ).bind(
-          body.device_id, env.USER_ID, body.alias ?? null, body.strategy,
-          body.threshold_p ?? null, body.hours ?? null, body.efficiency ?? 1, body.enabled === false ? 0 : 1
-        ).run()
-        return Response.json({ ...body, user_id: env.USER_ID })
-      }
-
-      if (pathname === "/api/kasa/devices/live" && request.method === "GET") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        const devices = await kasaDeviceList(env)
-        const results = await Promise.all(devices.map(async d => ({
-          device_id: d.deviceId,
-          alias: d.alias,
-          model: d.deviceModel,
-          status: d.status,
-          // Relay state requires a per-device passthrough; only reachable when online.
-          // null = unknown (offline or read failed).
-          on: d.status === 1
-            ? await kasaReadState(env, d).then(s => s === 1).catch(() => null)
-            : null,
-        })))
-        return Response.json({ results })
-      }
-
-      if (pathname === "/api/kasa/sync" && request.method === "GET") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        return Response.json({ results: await evaluateDevices(env) })
-      }
-
-      if (pathname === "/api/kasa/forecast" && request.method === "GET") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        // Read-only preview of which slots each enabled rule would switch the device
-        // on, from cached rates only. No Kasa calls and no switching.
-        const today = new Date().toISOString().slice(0, 10)
-        const param = searchParams.get("date")
-        const days = param ? [param] : [today, new Date(Date.now() + 86400000).toISOString().slice(0, 10)]
-        /** @type {{ results: any[] }} */
-        const { results: rules } = await env.DATABASE.prepare(
-          "SELECT * FROM devices WHERE user_id = ? AND enabled = 1"
-        ).bind(env.USER_ID).all()
-        const results = []
-        for (const rule of rules) {
-          const slots = []
-          for (const day of days) {
-            /** @type {{ results: { time_start: string, time_end: string, price: string }[] }} */
-            const { results: dayRates } = await env.DATABASE.prepare(
-              "SELECT time_start, time_end, price FROM rates WHERE user_id = ? AND time_start >= ? AND time_start < ? ORDER BY time_start ASC"
-            ).bind(env.USER_ID, `${day}T00:00:00Z`, `${day}T24:00:00Z`).all()
-            let qualifies
-            if (rule.strategy === "cheapest_hours") {
-              const set = await cheapestStarts(env, day, Math.max(1, Math.round(rule.hours * 2)))
-              qualifies = (/** @type {{ time_start: string }} */ r) => set.has(r.time_start)
-            } else if (rule.strategy === "cheaper_than_gas") {
-              // Gas is typically a flat daily rate; take one price for the day (noon).
-              const gasPrice = await gasPriceAt(env, `${day}T12:00:00Z`)
-              const ceiling = gasPrice == null ? -Infinity : gasPrice * (rule.efficiency ?? 1)
-              qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= ceiling
-            } else {
-              qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= rule.threshold_p
-            }
-            for (const r of dayRates) if (qualifies(r)) slots.push(r)
-          }
-          results.push({
-            device_id: rule.device_id,
-            alias: rule.alias,
-            strategy: rule.strategy,
-            threshold_p: rule.threshold_p,
-            hours: rule.hours,
-            efficiency: rule.efficiency,
-            on_slots: slots.length,
-            on_hours: slots.length / 2,
-            slots,
-          })
-        }
-        return Response.json({ days, results })
-      }
-
-      if (pathname === "/api/kasa/log" && request.method === "GET") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        const limit = Math.min(parseInt(searchParams.get("limit") || "50", 10), 200)
-        const { results } = await env.DATABASE.prepare(
-          `SELECT d.device_id, dev.alias, d.ts, d.action, d.price, d.reason
-           FROM device_log d LEFT JOIN devices dev ON dev.device_id = d.device_id
-           WHERE dev.user_id = ? OR dev.user_id IS NULL
-           ORDER BY d.ts DESC LIMIT ?`
-        ).bind(env.USER_ID, limit).all()
-        return Response.json({ results })
-      }
-
-      if (pathname === "/api/kasa/usage" && request.method === "GET") {
-        if (!authorized(request, env)) return new Response("Unauthorized", { status: 401 })
-        const identifier = searchParams.get("device")
-        if (!identifier) return new Response("Missing device", { status: 400 })
-        const kind = /** @type {"realtime" | "day" | "month"} */ (searchParams.get("kind") || "realtime")
-        if (!["realtime", "day", "month"].includes(kind)) {
-          return new Response("kind must be 'realtime', 'day' or 'month'", { status: 400 })
-        }
-        const now = new Date()
-        const year = parseInt(searchParams.get("year") || String(now.getUTCFullYear()), 10)
-        const month = parseInt(searchParams.get("month") || String(now.getUTCMonth() + 1), 10)
-        const dev = await findKasaDevice(env, identifier)
-        if (!dev) return new Response("Not Found", { status: 404 })
-        if (dev.status !== 1) return new Response("Device offline", { status: 409 })
-        return Response.json({
-          device_id: dev.deviceId,
-          alias: dev.alias,
-          kind,
-          ...(kind === "day" ? { year, month } : kind === "month" ? { year } : {}),
-          results: await kasaUsage(env, dev, kind, year, month),
-        })
-      }
-
-      return new Response("Hi! Read /api/octopus/rates/cache for the todays rates.");
+      return await handler(request, env, ctx, params)
     } catch (err) {
       console.error(err)
       return new Response("Internal Server Error", { status: 500 })
     }
   },
-};
+}

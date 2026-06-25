@@ -12,4 +12,5 @@ interface Env {
   USER_ID: string
   TPLINK_USERNAME: string
   TPLINK_PASSWORD: string
+  SQUID_API_KEY: string
 }

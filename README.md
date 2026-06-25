@@ -30,6 +30,7 @@ npx wrangler deploy
 Set the required secrets with Wrangler before deploying:
 
 ```bash
+npx wrangler secret put SQUID_API_KEY
 npx wrangler secret put OCTOPUS_API_KEY
 npx wrangler secret put OCTOPUS_ACCOUNT
 npx wrangler secret put ELECTRICITY_MPAN
@@ -41,7 +42,7 @@ npx wrangler secret put TPLINK_USERNAME
 npx wrangler secret put TPLINK_PASSWORD
 ```
 
-`TPLINK_USERNAME` / `TPLINK_PASSWORD` are your TP-Link Kasa **cloud account** credentials, used to control Kasa smart plugs based on the energy rates (see [Kasa device control](#kasa-device-control)).
+`SQUID_API_KEY` is the bearer token that gates every `/api/*` endpoint (see [Endpoints](#endpoints)). `OCTOPUS_API_KEY` is the upstream Octopus Energy credential used server-side to call the Octopus API — it is **not** the app's auth key. `TPLINK_USERNAME` / `TPLINK_PASSWORD` are your TP-Link Kasa **cloud account** credentials, used to control Kasa smart plugs based on the energy rates (see [Kasa device control](#kasa-device-control)).
 
 ### Database
 
@@ -130,8 +131,8 @@ The worker runs on two cron triggers, configured in `wrangler.toml`:
 
 | Cron | Action |
 |------|--------|
-| `32 */4 * * *` | Fetch the latest rates and insert them into D1 (same as `/api/octopus/rates/update`). |
-| `0,30 * * * *` | Evaluate the Kasa device rules against the current rate and switch as needed (same as `/api/kasa/sync`). |
+| `32 */4 * * *` | Fetch the latest rates and insert them into D1 (same as `POST /api/octopus/rates/refresh`). |
+| `0,30 * * * *` | Evaluate the Squid device rules against the current rate and switch as needed (same as `POST /api/squid/evaluate`). |
 
 The `scheduled()` handler dispatches on `event.cron`. Adjust the schedules as needed before deploying.
 
@@ -142,6 +143,7 @@ The `scheduled()` handler dispatches on `event.cron`. Adjust the schedules as ne
 Create a `.dev.vars` file in the project root (already gitignored) with your real values:
 
 ```ini
+SQUID_API_KEY=...
 OCTOPUS_API_KEY=sk_live_...
 OCTOPUS_ACCOUNT=A-XXXXXXXX
 ELECTRICITY_MPAN=...
@@ -152,6 +154,8 @@ USER_ID=...
 TPLINK_USERNAME=you@example.com
 TPLINK_PASSWORD=...
 ```
+
+`SQUID_API_KEY` is the bearer token for all `/api/*` endpoints. `OCTOPUS_API_KEY` is the upstream Octopus Energy credential — it is only used server-side to call the Octopus API, not as the app's auth key.
 
 Wrangler reads this file automatically when running locally — no changes to `wrangler.toml` are needed.
 
@@ -184,26 +188,41 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 
 ### Endpoints
 
-| Path | Description |
-|------|-------------|
-| `GET /api/octopus/rates/update` | Fetches the latest Agile tariff half-hourly unit rates from the Octopus Energy API and inserts them into the D1 database. Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. Returns the inserted rate data. |
-| `GET /api/octopus/rates/cache` | Returns rate entries from the local D1 database cache, ordered by most recent first. Supports query parameters (see below). |
-| `GET /api/octopus/rates/live` | Fetches and returns the current unit rates directly from the Octopus Energy API without reading from or writing to the database. |
-| `GET /api/octopus/meters/electricity` | Fetches consumption data for the configured electricity meter point from the Octopus Energy API. |
-| `GET /api/octopus/meters/gas` | Fetches consumption data for the configured gas meter point from the Octopus Energy API. |
-| `GET /api/octopus/tariff` | Returns the configured tariff for the user: `tariff_code`, the auto-discovered `gas_tariff_code`, and the `gas_price_p` override (if any). Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. |
-| `PUT /api/octopus/tariff` | Sets the electricity tariff and/or the gas price override. Requires `Authorization: Bearer <OCTOPUS_API_KEY>`. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}` and/or `{"gas_price_p": 6.5}` (pass `gas_price_p: null` to clear the override and fall back to the auto-fetched gas rate). |
-| `GET /api/kasa/devices` | Lists the configured device control rules from D1. Requires auth. |
-| `PUT /api/kasa/devices` | Creates or updates a device control rule. Requires auth. See [Kasa device control](#kasa-device-control). |
-| `GET /api/kasa/devices/live` | Lists the devices on your TP-Link Kasa cloud account (with their `device_id`s), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). Requires auth. |
-| `GET /api/kasa/sync` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. Requires auth. |
-| `GET /api/kasa/forecast` | Read-only preview of which half-hour slots each enabled rule would switch its device **on**, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. Each result includes `on_slots`, `on_hours` and the qualifying `slots` (with prices). Requires auth. |
-| `GET /api/kasa/usage` | Reads energy data from a device's emeter. Requires auth. Query: `device` (device_id or alias, required), `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
-| `GET /api/kasa/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). Requires auth. |
+All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 
-All `/api/kasa/*` endpoints require `Authorization: Bearer <OCTOPUS_API_KEY>`.
+#### `octopus/` — Octopus Energy data
 
-#### `/rates/cache` query parameters
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/octopus/rates` | Returns rate entries from the D1 cache, ordered by most recent first. Supports query parameters (see below). |
+| `GET` | `/api/octopus/rates/live` | Fetches and returns the current unit rates directly from the Octopus Energy API without reading from or writing to the database. |
+| `POST` | `/api/octopus/rates/refresh` | Fetches the latest Agile tariff half-hourly unit rates from the Octopus Energy API and inserts them into the D1 database. Returns the inserted rate data. |
+| `GET` | `/api/octopus/tariff` | Returns the configured tariff for the user: `tariff_code`, the auto-discovered `gas_tariff_code`, and the `gas_price_p` override (if any). |
+| `PUT` | `/api/octopus/tariff` | Sets the electricity tariff and/or the gas price override. Body: `{"tariff_code": "E-1R-AGILE-FLEX-22-11-25-A"}` and/or `{"gas_price_p": 6.5}` (pass `gas_price_p: null` to clear the override and fall back to the auto-fetched gas rate). |
+| `GET` | `/api/octopus/meters/:fuel` | Fetches consumption data from the Octopus Energy API. `:fuel` is `electricity` or `gas`. |
+
+#### `kasa/` — TP-Link hardware proxy
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (with their `device_id`s), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). |
+| `GET` | `/api/kasa/devices/:id` | Returns the live state of a single device. `:id` is a `device_id` or alias. |
+| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device on or off. Body: `{"on": true}`. Logs a `manual` entry. |
+| `GET` | `/api/kasa/devices/:id/usage` | Reads energy data from a device's emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
+| `GET` | `/api/kasa/devices/:id/rules` | Reads the on-device firmware rules for a device (`schedule`, `count_down`, `anti_theft`). Note: this only surfaces device-level rules set in the Kasa app's "Device" section — cloud Smart Actions (geofencing, device triggers) are **not** retrievable via this API. |
+
+#### `squid/` — rate-based automation
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/squid/rules` | Lists all Squid rate-based automation rules from D1. |
+| `PUT` | `/api/squid/rules/:deviceId` | Creates or updates a rule for a device. `:deviceId` is the TP-Link `device_id`. Body: `{"alias","strategy","threshold_p"\|"hours"\|"efficiency","enabled"}`. See [Kasa device control](#kasa-device-control). |
+| `DELETE` | `/api/squid/rules/:deviceId` | Deletes the rule for a device. |
+| `GET` | `/api/squid/forecast` | Read-only preview of which half-hour slots each enabled rule would switch its device **on**, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. Each result includes `on_slots`, `on_hours` and the qualifying `slots` (with prices). |
+| `POST` | `/api/squid/evaluate` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. |
+| `GET` | `/api/squid/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). |
+
+#### `/api/octopus/rates` query parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -219,13 +238,13 @@ All paginated endpoints return the same envelope:
 ```json
 {
   "count": 290,
-  "next": "https://example.workers.dev/api/octopus/rates/cache?page=2&limit=96",
+  "next": "https://example.workers.dev/api/octopus/rates?page=2&limit=96",
   "previous": null,
   "results": []
 }
 ```
 
-#### Rate object (`/rates/cache`)
+#### Rate object (`/api/octopus/rates`)
 
 ```json
 {
@@ -235,7 +254,7 @@ All paginated endpoints return the same envelope:
 }
 ```
 
-#### Rate object (`/rates/live` and `/rates/update`)
+#### Rate object (`/api/octopus/rates/live` and `/api/octopus/rates/refresh`)
 
 ```json
 {
@@ -247,7 +266,7 @@ All paginated endpoints return the same envelope:
 }
 ```
 
-#### Consumption object (`/meters/electricity` and `/meters/gas`)
+#### Consumption object (`/api/octopus/meters/electricity` and `/api/octopus/meters/gas`)
 
 ```json
 {
@@ -264,7 +283,12 @@ Octopus rates, turning dumb devices into rate-aware ones. It talks to the
 TP-Link **cloud** API (the same path the Kasa app uses), so no local network
 access to the plugs is required.
 
-Each device is controlled by a rule stored in the `devices` table. Three
+The API is split into two domains: `kasa/` proxies the TP-Link hardware
+(listing devices, reading state, manual switching, energy monitoring, and
+on-device firmware rules), while `squid/` holds the rate-based automation
+(rules, forecast, evaluate, and switching log).
+
+Each device is controlled by a Squid rule stored in the `devices` table. Three
 strategies are supported:
 
 | Strategy | Fields | Behaviour |
@@ -278,26 +302,26 @@ strategies are supported:
 1. Find your devices and their `device_id`s (the response also shows each
    device's online `status` and current `on` relay state):
    ```bash
-   curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-     https://<worker>/api/kasa/devices/live
+   curl -H "Authorization: Bearer $SQUID_API_KEY" \
+     https://<worker>/api/kasa/devices
    # {"results":[{"device_id":"80...","alias":"Smart Plug","model":"KP115(UK)","status":1,"on":true}]}
    ```
-2. Create a rule for a device:
+2. Create a Squid rule for a device (`:deviceId` is the `device_id` from step 1):
    ```bash
    # Turn a plug on whenever the price is 15p or cheaper
-   curl -X PUT -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-     -d '{"device_id":"80...","alias":"Dehumidifier","strategy":"threshold","threshold_p":15}' \
-     https://<worker>/api/kasa/devices
+   curl -X PUT -H "Authorization: Bearer $SQUID_API_KEY" \
+     -d '{"alias":"Dehumidifier","strategy":"threshold","threshold_p":15}' \
+     https://<worker>/api/squid/rules/80...
 
    # Keep a plug on during the cheapest 4 hours of the day
-   curl -X PUT -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-     -d '{"device_id":"81...","alias":"Battery","strategy":"cheapest_hours","hours":4}' \
-     https://<worker>/api/kasa/devices
+   curl -X PUT -H "Authorization: Bearer $SQUID_API_KEY" \
+     -d '{"alias":"Battery","strategy":"cheapest_hours","hours":4}' \
+     https://<worker>/api/squid/rules/81...
 
    # Run a heat pump (COP 3 vs a 90% boiler) only when electricity beats gas
-   curl -X PUT -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-     -d '{"device_id":"82...","alias":"Heat pump","strategy":"cheaper_than_gas","efficiency":3.3}' \
-     https://<worker>/api/kasa/devices
+   curl -X PUT -H "Authorization: Bearer $SQUID_API_KEY" \
+     -d '{"alias":"Heat pump","strategy":"cheaper_than_gas","efficiency":3.3}' \
+     https://<worker>/api/squid/rules/82...
    ```
    The gas price comes from your Octopus gas tariff automatically. If you're not
    on an Octopus gas tariff, set a manual rate: `PUT /api/octopus/tariff` with
@@ -305,36 +329,56 @@ strategies are supported:
 3. The `0,30 * * * *` cron evaluates every enabled rule each half hour. You can
    also trigger it manually:
    ```bash
-   curl -H "Authorization: Bearer $OCTOPUS_API_KEY" https://<worker>/api/kasa/sync
+   curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+     https://<worker>/api/squid/evaluate
    ```
 4. Preview which slots each rule will switch on (read-only, from cached rates):
    ```bash
-   curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-     https://<worker>/api/kasa/forecast            # today + tomorrow (UTC)
-   curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-     "https://<worker>/api/kasa/forecast?date=2026-06-25"   # a single day
+   curl -H "Authorization: Bearer $SQUID_API_KEY" \
+     https://<worker>/api/squid/forecast            # today + tomorrow (UTC)
+   curl -H "Authorization: Bearer $SQUID_API_KEY" \
+     "https://<worker>/api/squid/forecast?date=2026-06-25"   # a single day
    ```
 
 A device's relay state is read before each switch, so the worker only sends a
 command (and writes a `device_log` row) when the state actually needs to change.
 Set `"enabled": false` on a rule to leave a device alone without deleting it.
+To remove a rule entirely: `DELETE /api/squid/rules/:deviceId`.
+
+#### Manual device control
+
+You can also switch a device on or off directly, outside of any rule:
+
+```bash
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"on": true}' \
+  https://<worker>/api/kasa/devices/80.../state
+```
+
+#### On-device firmware rules
+
+`GET /api/kasa/devices/:id/rules` reads the schedule, countdown, and
+anti-theft rules stored on the device's firmware. These are the rules
+visible in the Kasa app's "Device" section. Cloud Smart Actions (geofencing,
+device triggers) are managed entirely by TP-Link's servers and are **not**
+retrievable via this API.
 
 #### Energy monitoring
 
-For devices with energy monitoring (an emeter), `/api/kasa/usage` reads
-consumption directly from the plug. `device` accepts a `device_id` or an alias:
+For devices with energy monitoring (an emeter), `/api/kasa/devices/:id/usage`
+reads consumption directly from the plug. `:id` accepts a `device_id` or an alias:
 
 ```bash
 # Live readings (voltage / current / power / total)
-curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-  "https://<worker>/api/kasa/usage?device=Dehumidifier"
+curl -H "Authorization: Bearer $SQUID_API_KEY" \
+  "https://<worker>/api/kasa/devices/Dehumidifier/usage"
 
 # Per-day totals for a given month
-curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-  "https://<worker>/api/kasa/usage?device=Dehumidifier&kind=day&year=2026&month=6"
+curl -H "Authorization: Bearer $SQUID_API_KEY" \
+  "https://<worker>/api/kasa/devices/Dehumidifier/usage?kind=day&year=2026&month=6"
 
 # Per-month totals for a given year
-curl -H "Authorization: Bearer $OCTOPUS_API_KEY" \
-  "https://<worker>/api/kasa/usage?device=Dehumidifier&kind=month&year=2026"
+curl -H "Authorization: Bearer $SQUID_API_KEY" \
+  "https://<worker>/api/kasa/devices/Dehumidifier/usage?kind=month&year=2026"
 ```
 
