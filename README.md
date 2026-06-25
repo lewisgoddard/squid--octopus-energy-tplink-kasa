@@ -62,6 +62,7 @@ Update `wrangler.toml` with your D1 `database_id`:
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_cache] (user_id text PRIMARY KEY, json text, updated_at text)"
    ```
 
 If you prefer to create the table in console, then use the following command:
@@ -127,6 +128,14 @@ CREATE TABLE IF NOT EXISTS [tplink_tokens] (
     token      text,
     updated_at text
 );
+
+-- Cron-refreshed snapshot of the TP-Link device list (ids/names/online), served
+-- to the metadata-only endpoints so they don't call the cloud per request.
+CREATE TABLE IF NOT EXISTS [device_cache] (
+    user_id    text PRIMARY KEY,
+    json       text,            -- the getDeviceList array
+    updated_at text
+);
 ```
 
 ### Scheduled Job
@@ -175,6 +184,7 @@ npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS 
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_cache] (user_id text PRIMARY KEY, json text, updated_at text)"
 ```
 
 ### Running locally
@@ -208,10 +218,12 @@ All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 
 #### `kasa/` — TP-Link hardware proxy
 
+`GET /api/kasa/devices` and `GET /api/kasa/devices/:id` go to the TP-Link cloud **live** for current relay (on/off) state. Everywhere else that needs device ids/names — resolving a `:id`, overlaying display names on rules/log — reads a **snapshot** of the device list (`device_cache`) instead of calling the cloud, sparing the API and the account-lockout risk. The snapshot is refreshed by the half-hourly evaluate cron **and by every live `kasa/devices`/`kasa/devices/:id` read** (they persist the list they fetch), so it's typically very fresh. A renamed/added/removed device shows up in the metadata endpoints after the next snapshot refresh; the two live endpoints reflect it immediately.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (with their `device_id`s), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). |
-| `GET` | `/api/kasa/devices/:id` | Returns the live state of a single device. `:id` is a `device_id` or alias. |
+| `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (**live**), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). |
+| `GET` | `/api/kasa/devices/:id` | Returns the **live** state of a single device. `:id` is a `device_id` or alias. |
 | `POST` | `/api/kasa/devices/:id/state` | Manually switch a device on or off. Body: `{"on": true}`. Logs a `manual` entry. |
 | `GET` | `/api/kasa/devices/:id/usage` | Reads energy data from a device's emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
 | `GET` | `/api/kasa/devices/:id/rules` | Reads the on-device firmware rules for a device (`schedule`, `count_down`, `anti_theft`). Note: this only surfaces device-level rules set in the Kasa app's "Device" section — cloud Smart Actions (geofencing, device triggers) are **not** retrievable via this API. |

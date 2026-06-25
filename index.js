@@ -265,36 +265,50 @@ async function kasaDeviceList(env) {
   return result.deviceList || []
 }
 
-// Module-global cache of the TP-Link device list, to limit cloud calls (and the
-// account-lockout risk). Best-effort and per-isolate with a short TTL — fresh
-// enough for name resolution and display while sparing the cloud from a call on
-// every request. The cron's evaluateDevices intentionally bypasses this and
-// reads live, since switching decisions need current relay state.
-/** @type {{ data: KasaDevice[] | null, expires: number }} */
-let _deviceListCache = { data: null, expires: 0 }
-const DEVICE_LIST_TTL_MS = 60_000
+// Persisted snapshot of the TP-Link device list (ids/names/online/appServerUrl),
+// refreshed by the cron. The metadata-only endpoints (id/alias resolution and
+// display-name overlay) read this instead of calling the cloud on every request,
+// sparing the API and the account-lockout risk. The two live endpoints
+// (kasa/devices and kasa/devices/:id) deliberately bypass it for fresh relay state.
 
 /**
+ * Fetches the live device list and persists it as the metadata snapshot.
+ * Called by the cron (reusing its existing getDeviceList) and on cold start.
  * @param {Env} env
  * @returns {Promise<KasaDevice[]>}
  */
-async function cachedDeviceList(env) {
-  const now = Date.now()
-  if (_deviceListCache.data && _deviceListCache.expires > now) return _deviceListCache.data
-  const data = await kasaDeviceList(env)
-  _deviceListCache = { data, expires: now + DEVICE_LIST_TTL_MS }
-  return data
+async function refreshDeviceSnapshot(env) {
+  const devices = await kasaDeviceList(env)
+  await env.DATABASE.prepare(
+    "INSERT INTO device_cache (user_id, json, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at"
+  ).bind(env.USER_ID, JSON.stringify(devices), new Date().toISOString()).run()
+  return devices
 }
 
 /**
- * Map of deviceId -> current live alias, for overlaying display names onto
- * stored rows. Resilient: returns an empty map if the cloud is unreachable so
- * reads fall back to the stored alias rather than failing.
+ * The persisted device-metadata snapshot. Lazily populates from the cloud the
+ * first time, before the cron has run.
+ * @param {Env} env
+ * @returns {Promise<KasaDevice[]>}
+ */
+async function snapshotDeviceList(env) {
+  /** @type {{ json: string } | null} */
+  const row = await env.DATABASE.prepare(
+    "SELECT json FROM device_cache WHERE user_id = ?"
+  ).bind(env.USER_ID).first()
+  if (row && row.json) return JSON.parse(row.json)
+  return refreshDeviceSnapshot(env)
+}
+
+/**
+ * Map of deviceId -> alias from the snapshot, for overlaying display names onto
+ * stored rows. Resilient: empty map on failure so reads fall back to the stored
+ * alias rather than failing.
  * @param {Env} env
  * @returns {Promise<Map<string, string | undefined>>}
  */
-async function liveAliasMap(env) {
-  const devices = await cachedDeviceList(env).catch(() => /** @type {KasaDevice[]} */ ([]))
+async function aliasMap(env) {
+  const devices = await snapshotDeviceList(env).catch(() => /** @type {KasaDevice[]} */ ([]))
   return new Map(devices.map(d => [d.deviceId, d.alias]))
 }
 
@@ -333,16 +347,18 @@ async function kasaSetState(env, dev, on) {
 }
 
 /**
- * Resolves a device by its deviceId or (case-insensitive) alias, from the cached
- * device list. deviceId always wins (it is unique). An alias matching more than
- * one device is reported as ambiguous rather than silently guessed, since
- * TP-Link does not enforce unique aliases.
+ * Resolves a device by its deviceId or (case-insensitive) alias. deviceId always
+ * wins (it is unique). An alias matching more than one device is reported as
+ * ambiguous rather than silently guessed, since TP-Link does not enforce unique
+ * aliases. Defaults to the persisted snapshot; pass `devices` to resolve against
+ * a live list (used by the live kasa/devices/:id endpoint).
  * @param {Env} env
  * @param {string} identifier
+ * @param {KasaDevice[]} [devices]
  * @returns {Promise<{ device: KasaDevice | null, ambiguous: boolean }>}
  */
-async function resolveDevice(env, identifier) {
-  const devices = await cachedDeviceList(env)
+async function resolveDevice(env, identifier, devices) {
+  devices ??= await snapshotDeviceList(env)
   const byId = devices.find(d => d.deviceId === identifier)
   if (byId) return { device: byId, ambiguous: false }
   const name = identifier.toLowerCase()
@@ -472,11 +488,14 @@ async function evaluateDevices(env) {
      FROM rules r JOIN rule_devices rd ON rd.rule_id = r.rule_id
      WHERE r.user_id = ? AND r.enabled = 1`
   ).bind(env.USER_ID).all()
+  // Refresh the device-metadata snapshot from this fetch (we need live status
+  // for switching anyway) so the read endpoints stay off the cloud. Done before
+  // the early return so the snapshot stays fresh even with no rules.
+  const liveDevices = await refreshDeviceSnapshot(env)
   if (!pairs.length) return []
 
   const nowISO = new Date().toISOString()
   const rate = await currentRate(env, nowISO)
-  const liveDevices = await kasaDeviceList(env)
   const byId = new Map(liveDevices.map(d => [d.deviceId, d]))
 
   // Group the rules that apply to each device.
@@ -738,7 +757,9 @@ async function handleOctopusMeters(request, env, _ctx, params) {
  * @returns {Promise<Response>}
  */
 async function handleKasaDevices(_request, env, _ctx, _params) {
-  const devices = await kasaDeviceList(env)
+  // Live read — and persist the snapshot from this fetch so the metadata
+  // endpoints stay fresh between cron runs (relay state below is still live).
+  const devices = await refreshDeviceSnapshot(env)
   const results = await Promise.all(devices.map(async d => ({
     device_id: d.deviceId,
     alias: d.alias,
@@ -762,7 +783,9 @@ async function handleKasaDevices(_request, env, _ctx, _params) {
  * @returns {Promise<Response>}
  */
 async function handleKasaDevice(_request, env, _ctx, params) {
-  const { device: dev, ambiguous } = await resolveDevice(env, params.id)
+  // Live endpoint: resolve against the live list (not the snapshot) and read
+  // relay state fresh from the cloud; persist the snapshot from this fetch too.
+  const { device: dev, ambiguous } = await resolveDevice(env, params.id, await refreshDeviceSnapshot(env))
   if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!dev) return new Response("Not Found", { status: 404 })
   return Response.json({
@@ -883,7 +906,7 @@ async function ruleDeviceMap(env) {
   const { results } = await env.DATABASE.prepare(
     "SELECT rule_id, device_id FROM rule_devices WHERE user_id = ?"
   ).bind(env.USER_ID).all()
-  const aliasById = await liveAliasMap(env)
+  const aliasById = await aliasMap(env)
   /** @type {Map<string, { device_id: string, alias: string | undefined }[]>} */
   const map = new Map()
   for (const r of /** @type {{ rule_id: string, device_id: string }[]} */ (results)) {
@@ -1144,7 +1167,7 @@ async function handleSquidLog(request, env, _ctx, _params) {
      WHERE user_id = ? OR user_id IS NULL
      ORDER BY ts DESC LIMIT ?`
   ).bind(env.USER_ID, limit).all()
-  const aliasById = await liveAliasMap(env)
+  const aliasById = await aliasMap(env)
   const enriched = /** @type {any[]} */ (results).map(r => ({ ...r, alias: aliasById.get(r.device_id) ?? null }))
   return Response.json({ results: enriched })
 }
