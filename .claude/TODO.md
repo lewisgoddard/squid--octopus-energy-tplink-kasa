@@ -44,5 +44,7 @@
         #4). Plan: plans/TAPO_SMART_TRANSPORT.md. Phase 0+1 DONE. Protocol is simple (Tapo V2
         login + HMAC-SHA1 signing + plaintext /api/v2/common/passthrough; NO device crypto).
         CONFIRMED via deployed spike: a pure Worker CANNOT reach the Tapo V2 cloud — fetch→526
-        (private CA), node:tls won't socket to a web service. ⇒ needs a RELAY (Container/DO
-        sidecar, or external box via Tunnel) running the Tapo calls. Decide relay shape next.
+        (private CA), node:tls won't socket to a web service. ⇒ needs a RELAY. Chosen shape:
+        minimal STATELESS passthrough Container (CA-trusting HTTPS forwarder, host-allowlisted,
+        binding-only) — Worker keeps ALL per-user auth/login/HMAC-signing/token cache; container
+        holds no creds. Next: container spike to prove a Container reaches the Tapo cloud.

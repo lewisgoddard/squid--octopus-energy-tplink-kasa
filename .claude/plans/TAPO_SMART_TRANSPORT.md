@@ -125,9 +125,12 @@ Much smaller than the original crypto-heavy plan:
 0. **✅ Research** — done.
 1. **✅ TLS spike** — done & **deployed** to the real edge. Result: pure-Worker is impossible
    (526 on `fetch`; `node:tls` won't socket to a web service). → a **relay** is required.
-2. **⛳ Decide + stand up a relay** (now the gating step) — Container/DO sidecar, or external
-   box via Tunnel. Everything below runs *on the relay*.
-3. **Login + device list** — `tapoToken`, signed V2 `getDeviceListByPage`.
+2. **⛳ Relay** (now the gating step) — minimal passthrough Container (see Relay design). Best
+   validated first by a **container spike**: forward one request to `n-wap.i.tplinkcloud.com`
+   from a Container called by a Worker, and confirm it gets past the cert (expect 405/JSON,
+   not 526). Proves the architecture before building the transport.
+3. **Login + device list** — `tapoToken` + signing **in the Worker**, sent *through* the
+   relay; signed V2 `getDeviceListByPage`.
 4. **One Tapo plug end-to-end** — read + on/off via signed `passthrough`. Validates auth +
    signing + transport before hubs.
 5. **Hub children** — `control_child` for KE100; un-gate `kasaSetTargetTemp`.
@@ -163,6 +166,44 @@ protocol itself is small and understood — so the work is now entirely about **
 
 Until a relay exists, Tier-3 TRV writes stay gated (the rule model is already done and inert).
 This is a **product/infra decision** — confirm the relay shape before building.
+
+## Relay design — minimal passthrough Container (chosen direction)
+
+The relay is a **stateless, credential-free, CA-trusting HTTPS forwarder** — nothing more.
+All TP-Link/per-user logic stays in the Worker; the Container only does the one thing the
+Worker can't: terminate TLS to a private-CA origin and forward.
+
+**Responsibility split (multi-user safe):**
+
+| Concern | Where | Why |
+|---|---|---|
+| Per-user Tapo creds, login (`/api/v2/account/login`), token cache | **Worker + D1** (`tapo_tokens` by user_id) | secrets never live in the relay |
+| HMAC-SHA1 request signing (Content-MD5 + X-Authorization) | **Worker** (`node:crypto`) | signature covers body/path/nonce only — unaffected by forwarding |
+| Building the call (method/params, `control_child`, query) | **Worker** | all SMART semantics stay in one place |
+| Retry / token refresh / lockout / rate-limit (per user) | **Worker** | |
+| **Trust the TP-Link CA + forward the request** | **Container** | the *only* job the Worker can't do |
+
+**Interface (generic, no TP-Link knowledge in the Container):**
+- Worker → Container via a **Container binding** (DO-fronted; *not* a public URL), sending the
+  fully-formed request: target URL + method + headers (incl. the signature) + body.
+- Container validates the host against an **allowlist (`*.tplinkcloud.com`)**, forwards with
+  the TP-Link CA trusted (`NODE_EXTRA_CA_CERTS=/certs/tplink-ca.pem`, or explicit `ca`), and
+  streams back `{status, headers, body}`. ~40 lines; reusable for any private-CA origin.
+
+**Security:** binding-only (no public ingress) + host allowlist (no SSRF/open-proxy) +
+optional shared-secret header. CA baked into the image.
+
+**Consequences to accept (call these out):**
+1. **Credentials transit the relay.** To reach the private-CA host, the Container must
+   terminate TLS, so it *sees* the plaintext per-user traffic — including the password on the
+   login call. It **stores** nothing, but it's in the credential path. Fine for a
+   single-operator self-host; for true multi-tenant SaaS the operator's relay sees users'
+   TP-Link traffic (inherent to any cloud relay — can't be avoided while the Worker can't do
+   the TLS itself). Pure TCP passthrough doesn't help (the Worker still couldn't do the TLS).
+2. **Cold starts / cost.** Containers scale to zero and wake on request (~seconds). Fine for
+   the 30-min evaluate cron; adds a little latency to interactive control.
+3. The Container is shared across users and holds **no state** — all fan-out/keying is the
+   Worker's, by `user_id`, exactly as today.
 
 ## Sources
 
