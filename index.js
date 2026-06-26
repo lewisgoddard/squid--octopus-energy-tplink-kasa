@@ -485,6 +485,16 @@ function isBulb(dev) {
 }
 
 /**
+ * @param {KasaDevice} dev
+ * @returns {boolean} true for a hub-connected TRV / thermostat (KE100). These
+ *   speak the SMART/Tapo protocol, so they aren't reachable over the Kasa IOT
+ *   passthrough yet (see {@link kasaSetTargetTemp}); detection is forward-looking.
+ */
+function isThermostat(dev) {
+  return /thermostat|trv/i.test(dev.deviceType || "")
+}
+
+/**
  * The on/off state of a device or one of its outlets, from a `get_sysinfo`. A
  * power strip has no top-level `relay_state` (each outlet carries its own in
  * `children[]`); a bulb has no relay at all and reports `light_state.on_off`.
@@ -548,6 +558,42 @@ async function kasaSetColor(env, dev, colour) {
 }
 
 /**
+ * Sets a hub-connected TRV's target temperature (°C).
+ *
+ * NOT YET WIRED. KE100/KH100 speak the SMART/Tapo protocol — python-kasa sets the
+ * target via `set_device_info {"target_temp": <c>}`, reached through an encrypted
+ * `securePassthrough` after a Tapo (`TP-Link_Tapo_Android`) login and addressed on
+ * the hub with `control_child` / `child_ids`. Squid's cloud transport is Kasa IOT
+ * (`appType: Kasa_Android`, plain `passthrough`), which can't carry SMART commands,
+ * so sending over it would be wrong rather than merely unverified. Throws until the
+ * SMART/Tapo transport exists; the evaluate setpoint pass reports the intended
+ * temperature and skips the send. The intended payload, for when that lands:
+ *   securePassthrough → { method: "control_child", params: {
+ *     device_id: childId,
+ *     requestData: { method: "set_device_info", params: { target_temp: tempC } } } }
+ * @param {Env} env
+ * @param {KasaDevice} dev - the hub (or the thermostat itself, if standalone).
+ * @param {string | null} childId - the TRV's device id when hub-connected, else null.
+ * @param {number} tempC
+ * @returns {Promise<void>}
+ */
+async function kasaSetTargetTemp(env, dev, childId, tempC) {
+  void env; void dev; void childId; void tempC
+  throw new Error("TRV setpoint needs the SMART/Tapo cloud transport (not yet implemented)")
+}
+
+/**
+ * The target temperature a setpoint rule wants right now: `comfort_c` when the
+ * rule is active, else `setback_c`. ("Active" already includes any `invert`.)
+ * @param {{ comfort_c: number, setback_c: number }} rule
+ * @param {boolean} active
+ * @returns {number}
+ */
+function setpointFor(rule, active) {
+  return active ? rule.comfort_c : rule.setback_c
+}
+
+/**
  * A control target: a whole device, or one outlet of a power strip.
  * @typedef {Object} KasaTarget
  * @property {KasaDevice} device - the device, or the strip parent for an outlet.
@@ -568,6 +614,19 @@ function outletParent(devices, identifier) {
     identifier.length === d.deviceId.length + 2 &&
     identifier.startsWith(d.deviceId) &&
     /^\d{2}$/.test(identifier.slice(d.deviceId.length)))
+}
+
+/**
+ * Finds the hub that parents the child whose device id is `identifier`. Unlike a
+ * strip outlet (a deviceId+index, resolved structurally), a hub child (e.g. a
+ * KE100 TRV under a KH100) has its own independent deviceId, so it can only be
+ * found by an exact match against a cached `children[].id`.
+ * @param {KasaDevice[]} devices
+ * @param {string} identifier
+ * @returns {KasaDevice | undefined}
+ */
+function hubOf(devices, identifier) {
+  return devices.find(d => (d.children || []).some(c => c.id === identifier))
 }
 
 /**
@@ -685,8 +744,11 @@ async function gasPriceAt(env, atISO) {
 }
 
 /**
- * Whether a rule wants its tagged devices ON at the given moment. Returns null
- * when the rule can't be evaluated (e.g. cheaper_than_gas with no gas price).
+ * Whether a rule wants its tagged devices "active" at the given moment. For an
+ * on/off rule that's ON; for a setpoint rule it selects comfort vs setback. An
+ * `invert` flag flips the result (e.g. inverted `cheaper_than_gas`: active when
+ * electricity is *dearer* than gas — so a gas TRV comforts and a heat pump idles).
+ * Returns null when the rule can't be evaluated (e.g. cheaper_than_gas with no gas price).
  * @param {Env} env
  * @param {any} rule
  * @param {{ time_start: string, price: string }} rate
@@ -696,21 +758,25 @@ async function gasPriceAt(env, atISO) {
 async function ruleDesired(env, rule, rate, nowISO) {
   const label = rule.name || rule.rule_id
   const price = parseFloat(rate.price)
+  /** @type {{ on: boolean, reason: string } | null} */
+  let base
   if (rule.strategy === "cheapest_hours") {
     const set = await cheapestStarts(env, nowISO.slice(0, 10), Math.max(1, Math.round(rule.hours * 2)))
     const on = set.has(rate.time_start)
-    return { on, reason: `${label}: cheapest ${rule.hours}h${on ? "" : " (not now)"}` }
-  }
-  if (rule.strategy === "cheaper_than_gas") {
+    base = { on, reason: `${label}: cheapest ${rule.hours}h${on ? "" : " (not now)"}` }
+  } else if (rule.strategy === "cheaper_than_gas") {
     const gasPrice = await gasPriceAt(env, nowISO)
     if (gasPrice == null) return null
     const eff = rule.efficiency ?? 1
     const ceiling = gasPrice * eff
     const on = price <= ceiling
-    return { on, reason: `${label}: ${price}p ${on ? "<=" : ">"} gas ${gasPrice}p×${eff} (${ceiling.toFixed(2)}p)` }
+    base = { on, reason: `${label}: ${price}p ${on ? "<=" : ">"} gas ${gasPrice}p×${eff} (${ceiling.toFixed(2)}p)` }
+  } else {
+    const on = price <= rule.threshold_p
+    base = { on, reason: `${label}: ${price}p ${on ? "<=" : ">"} ${rule.threshold_p}p` }
   }
-  const on = price <= rule.threshold_p
-  return { on, reason: `${label}: ${price}p ${on ? "<=" : ">"} ${rule.threshold_p}p` }
+  if (rule.invert) return { on: !base.on, reason: `${base.reason} (inverted)` }
+  return base
 }
 
 /**
@@ -725,7 +791,7 @@ async function ruleDesired(env, rule, rate, nowISO) {
 async function evaluateDevices(env) {
   /** @type {{ results: any[] }} */
   const { results: pairs } = await env.DATABASE.prepare(
-    `SELECT r.rule_id, r.name, r.strategy, r.threshold_p, r.hours, r.efficiency, r.color_config, rd.device_id
+    `SELECT r.rule_id, r.name, r.strategy, r.threshold_p, r.hours, r.efficiency, r.invert, r.comfort_c, r.setback_c, r.color_config, rd.device_id
      FROM rules r JOIN rule_devices rd ON rd.rule_id = r.rule_id
      WHERE r.user_id = ? AND r.enabled = 1`
   ).bind(env.USER_ID).all()
@@ -739,16 +805,19 @@ async function evaluateDevices(env) {
   const rate = await currentRate(env, nowISO)
   const byId = new Map(liveDevices.map(d => [d.deviceId, d]))
 
-  // price_color rules drive a bulb's *colour*, not on/off — handle them in a
-  // separate pass, and keep their bulbs out of the any-on switching below.
+  // Three kinds of rule drive different outputs: price_color → a bulb's colour,
+  // setpoint (comfort_c/setback_c) → a TRV's target temperature, everything else
+  // → on/off. Colour and setpoint devices are handled in their own passes and kept
+  // out of the any-on on/off switching below.
   const colorPairs = pairs.filter(p => p.strategy === "price_color")
-  const indicatorDeviceIds = new Set(colorPairs.map(p => p.device_id))
+  const setpointPairs = pairs.filter(p => p.comfort_c != null && p.setback_c != null)
+  const handledElsewhere = new Set([...colorPairs, ...setpointPairs].map(p => p.device_id))
 
   // Group the on/off rules that apply to each tagged load (deviceId or outlet id).
   /** @type {Map<string, any[]>} */
   const rulesByTarget = new Map()
   for (const p of pairs) {
-    if (p.strategy === "price_color" || indicatorDeviceIds.has(p.device_id)) continue
+    if (p.strategy === "price_color" || (p.comfort_c != null && p.setback_c != null) || handledElsewhere.has(p.device_id)) continue
     let list = rulesByTarget.get(p.device_id)
     if (!list) { list = []; rulesByTarget.set(p.device_id, list) }
     list.push(p)
@@ -838,6 +907,36 @@ async function evaluateDevices(env) {
       actions.push({ device_id: deviceId, alias, action: "color", hue: target.hue, reason })
     } else {
       actions.push({ device_id: deviceId, alias, action: "unchanged", reason })
+    }
+  }
+
+  // Setpoint pass: drive each tagged TRV's target temperature from its rule.
+  // One setpoint rule per TRV (first wins). The send is gated on the SMART/Tapo
+  // transport (see kasaSetTargetTemp), so for now this reports the intended
+  // temperature and skips the write rather than sending over the wrong transport.
+  /** @type {Map<string, any>} */
+  const setpointRuleByDevice = new Map()
+  for (const p of setpointPairs) if (!setpointRuleByDevice.has(p.device_id)) setpointRuleByDevice.set(p.device_id, p)
+  for (const [targetId, rule] of setpointRuleByDevice) {
+    const dev = byId.get(targetId) ?? hubOf(liveDevices, targetId)
+    if (!dev) { actions.push({ device_id: targetId, skipped: "not found" }); continue }
+    const childId = byId.has(targetId) ? null : targetId
+    const alias = childId ? ((dev.children || []).find(c => c.id === childId)?.alias ?? null) : dev.alias
+    if (dev.status !== 1) { actions.push({ device_id: targetId, alias, skipped: "offline" }); continue }
+    if (!rate) { actions.push({ device_id: targetId, alias, skipped: "no rate data" }); continue }
+    const desired = await ruleDesired(env, rule, rate, nowISO)
+    if (!desired) { actions.push({ device_id: targetId, alias, skipped: "no evaluable rule" }); continue }
+    const temp = setpointFor(rule, desired.on)
+    const reason = `${desired.reason} → ${desired.on ? "comfort" : "setback"} ${temp}°`
+    try {
+      await kasaSetTargetTemp(env, dev, childId, temp)
+      await env.DATABASE.prepare(
+        "INSERT INTO device_log (device_id, user_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(targetId, env.USER_ID, nowISO, `setpoint ${temp}`, parseFloat(rate.price), reason).run()
+      actions.push({ device_id: targetId, alias, action: "setpoint", target_c: temp, reason })
+    } catch (err) {
+      // Expected until the SMART/Tapo transport lands — report intent, don't fail.
+      actions.push({ device_id: targetId, alias, skipped: `setpoint unsupported: ${err instanceof Error ? err.message : err}`, target_c: temp, reason })
     }
   }
   return actions
@@ -1440,6 +1539,16 @@ function validateRuleBody(body) {
   if (body.strategy === "threshold" && body.threshold_p == null) return "Missing threshold_p"
   if (body.strategy === "cheapest_hours" && body.hours == null) return "Missing hours"
   if (body.efficiency != null && !(body.efficiency > 0)) return "efficiency must be a positive number"
+  if (body.invert != null && typeof body.invert !== "boolean" && body.invert !== 0 && body.invert !== 1) {
+    return "invert must be a boolean"
+  }
+  // Setpoint mode (TRV): both temperatures, and an on/off strategy to gate them.
+  const hasComfort = body.comfort_c != null, hasSetback = body.setback_c != null
+  if (hasComfort || hasSetback) {
+    if (!(hasComfort && hasSetback)) return "setpoint rules need both comfort_c and setback_c"
+    if (typeof body.comfort_c !== "number" || typeof body.setback_c !== "number") return "comfort_c and setback_c must be numbers"
+    if (body.strategy === "price_color") return "price_color can't be a setpoint rule"
+  }
   if (body.strategy === "price_color") return validateColorBody(body)
   return null
 }
@@ -1450,22 +1559,30 @@ function validateRuleBody(body) {
  *
  * - Every strategy: a strip *parent* is rejected unless the strip has a master
  *   relay (`master`); most strips don't, so tag their outlets instead.
+ * - A *setpoint* rule (comfort_c/setback_c) drives a thermostat's target temp, so
+ *   it needs a thermostat (TRV) and nothing else; conversely an on/off or colour
+ *   rule may not target a thermostat.
  * - The on/off strategies (threshold / cheapest_hours / cheaper_than_gas) drive a
- *   relay or a bulb's on/off, so they're valid on any allowed load.
+ *   relay or a bulb's on/off, so they're valid on any allowed non-thermostat load.
  * - `price_color` drives a bulb's hue, so it needs a colour-capable bulb: a
  *   non-bulb (plug/switch/outlet) is rejected outright, and a bulb with cached
  *   `caps.color === false` is rejected. Unknown caps are allowed (they resolve on
  *   the next live read; evaluate skips a non-colour bulb either way).
  * @param {string} strategy
  * @param {KasaTarget} target
+ * @param {boolean} [isSetpoint] - the rule carries comfort_c/setback_c.
  * @returns {string | null}
  */
-function ruleTargetError(strategy, target) {
+function ruleTargetError(strategy, target, isSetpoint) {
   const { device: dev, childId } = target
   // A strip parent is only a valid whole-device target when it has a master relay.
   if (!childId && dev.children?.length && !dev.master) {
     return `This is a power strip; tag a specific outlet instead (${dev.children.map(c => c.id).join(", ")})`
   }
+  if (isSetpoint) {
+    return isThermostat(dev) ? null : "setpoint rules (comfort_c/setback_c) need a thermostat (TRV) target"
+  }
+  if (isThermostat(dev)) return "a thermostat needs a setpoint rule (comfort_c/setback_c), not on/off or colour"
   if (strategy === "price_color") {
     if (childId || !isBulb(dev)) return "price_color needs a colour bulb; this device has no colour"
     if (dev.caps && !dev.caps.color) return "This bulb doesn't support colour (hue/saturation)"
@@ -1591,7 +1708,7 @@ function ruleForResponse(row) {
  */
 async function handleSquidRulesList(_request, env, _ctx, _params) {
   const { results: rules } = await env.DATABASE.prepare(
-    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled, color_config FROM rules WHERE user_id = ?"
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, invert, comfort_c, setback_c, enabled, color_config FROM rules WHERE user_id = ?"
   ).bind(env.USER_ID).all()
   const devicesByRule = await ruleDeviceMap(env)
   const enriched = /** @type {any[]} */ (rules).map(r => ({ ...ruleForResponse(r), devices: devicesByRule.get(r.rule_id) ?? [] }))
@@ -1618,6 +1735,7 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
   // unsuitable device (e.g. a non-colour bulb on a price_color rule) rejects the
   // whole request rather than leaving a half-tagged rule. Unknown ids are kept
   // as-is (caught later at evaluate); known ids are stored canonically.
+  const isSetpoint = body.comfort_c != null && body.setback_c != null
   const deviceIds = Array.isArray(body.device_ids) ? body.device_ids : []
   /** @type {string[]} */
   const resolvedIds = []
@@ -1625,7 +1743,7 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
     const { target, ambiguous } = await resolveTarget(env, id)
     if (ambiguous) return new Response(`Ambiguous device name '${id}'; use the deviceId`, { status: 409 })
     if (!target) { resolvedIds.push(id); continue }
-    const targetErr = ruleTargetError(body.strategy, target)
+    const targetErr = ruleTargetError(body.strategy, target, isSetpoint)
     if (targetErr) return new Response(targetErr, { status: 409 })
     resolvedIds.push(target.childId ?? target.device.deviceId)
   }
@@ -1633,10 +1751,13 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
   const rule_id = crypto.randomUUID()
   const efficiency = body.efficiency ?? 1
   const enabled = body.enabled === false ? 0 : 1
+  const invert = body.invert ? 1 : 0
+  const comfort_c = isSetpoint ? body.comfort_c : null
+  const setback_c = isSetpoint ? body.setback_c : null
   const color = body.strategy === "price_color" ? colorConfigFromBody(body) : null
   await env.DATABASE.prepare(
-    "INSERT INTO rules (rule_id, user_id, name, strategy, threshold_p, hours, efficiency, enabled, color_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  ).bind(rule_id, env.USER_ID, body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled, color ? JSON.stringify(color) : null).run()
+    "INSERT INTO rules (rule_id, user_id, name, strategy, threshold_p, hours, efficiency, invert, comfort_c, setback_c, enabled, color_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(rule_id, env.USER_ID, body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, invert, comfort_c, setback_c, enabled, color ? JSON.stringify(color) : null).run()
   for (const deviceId of resolvedIds) {
     await env.DATABASE.prepare(
       "INSERT OR IGNORE INTO rule_devices (rule_id, device_id, user_id) VALUES (?, ?, ?)"
@@ -1644,7 +1765,7 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
   }
   return Response.json({
     rule_id, user_id: env.USER_ID, name: body.name ?? null, strategy: body.strategy,
-    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled,
+    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, invert, comfort_c, setback_c, enabled,
     ...(color ? { color } : {}), device_ids: resolvedIds,
   }, { status: 201 })
 }
@@ -1659,7 +1780,7 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
  */
 async function handleSquidRuleGet(_request, env, _ctx, params) {
   const rule = await env.DATABASE.prepare(
-    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled, color_config FROM rules WHERE user_id = ? AND rule_id = ?"
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, invert, comfort_c, setback_c, enabled, color_config FROM rules WHERE user_id = ? AND rule_id = ?"
   ).bind(env.USER_ID, params.ruleId).first()
   if (!rule) return new Response("Not Found", { status: 404 })
   const devicesByRule = await ruleDeviceMap(env)
@@ -1685,14 +1806,18 @@ async function handleSquidRuleUpdate(request, env, _ctx, params) {
   if (!exists) return new Response("Not Found", { status: 404 })
   const efficiency = body.efficiency ?? 1
   const enabled = body.enabled === false ? 0 : 1
+  const invert = body.invert ? 1 : 0
+  const isSetpoint = body.comfort_c != null && body.setback_c != null
+  const comfort_c = isSetpoint ? body.comfort_c : null
+  const setback_c = isSetpoint ? body.setback_c : null
   const color = body.strategy === "price_color" ? colorConfigFromBody(body) : null
   await env.DATABASE.prepare(
-    `UPDATE rules SET name = ?, strategy = ?, threshold_p = ?, hours = ?, efficiency = ?, enabled = ?, color_config = ?
+    `UPDATE rules SET name = ?, strategy = ?, threshold_p = ?, hours = ?, efficiency = ?, invert = ?, comfort_c = ?, setback_c = ?, enabled = ?, color_config = ?
      WHERE user_id = ? AND rule_id = ?`
-  ).bind(body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled, color ? JSON.stringify(color) : null, env.USER_ID, params.ruleId).run()
+  ).bind(body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, invert, comfort_c, setback_c, enabled, color ? JSON.stringify(color) : null, env.USER_ID, params.ruleId).run()
   return Response.json({
     rule_id: params.ruleId, user_id: env.USER_ID, name: body.name ?? null, strategy: body.strategy,
-    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled,
+    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, invert, comfort_c, setback_c, enabled,
     ...(color ? { color } : {}),
   })
 }
@@ -1727,16 +1852,16 @@ async function handleSquidRuleDelete(_request, env, _ctx, params) {
  * @returns {Promise<Response>}
  */
 async function handleSquidRuleTagDevice(_request, env, _ctx, params) {
-  /** @type {{ strategy: string } | null} */
+  /** @type {{ strategy: string, comfort_c: number | null } | null} */
   const rule = await env.DATABASE.prepare(
-    "SELECT strategy FROM rules WHERE user_id = ? AND rule_id = ?"
+    "SELECT strategy, comfort_c FROM rules WHERE user_id = ? AND rule_id = ?"
   ).bind(env.USER_ID, params.ruleId).first()
   if (!rule) return new Response("Rule not found", { status: 404 })
   const { target, ambiguous } = await resolveTarget(env, params.id)
   if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!target) return new Response("Unknown device; not found on your TP-Link account", { status: 404 })
   const { device: dev, childId } = target
-  const targetErr = ruleTargetError(rule.strategy, target)
+  const targetErr = ruleTargetError(rule.strategy, target, rule.comfort_c != null)
   if (targetErr) return new Response(targetErr, { status: 409 })
   const taggedId = childId ?? dev.deviceId
   await env.DATABASE.prepare(
@@ -2008,16 +2133,20 @@ export default {
 // the default export above; these named exports are inert at runtime.
 export {
   isBulb,
+  isThermostat,
   relayStateOf,
   childrenFromSysinfo,
   capsFromSysinfo,
   factsFromSysinfo,
   outletParent,
+  hubOf,
   colorBandFor,
   bandIndexFor,
   colorConfigFromBody,
   validateRuleBody,
   ruleTargetError,
+  ruleDesired,
+  setpointFor,
   aggregateDays,
   matchRoute,
 }

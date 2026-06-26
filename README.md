@@ -58,7 +58,7 @@ Update `wrangler.toml` with your D1 `database_id`:
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1, color_config text)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1, color_config text, invert integer DEFAULT 0, comfort_c real, setback_c real)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
@@ -104,7 +104,10 @@ CREATE TABLE IF NOT EXISTS [rules] (
     hours        real,              -- for 'cheapest_hours': keep on during the cheapest N hours of the day
     efficiency   real DEFAULT 1,    -- for 'cheaper_than_gas': on when elec price <= gas price x efficiency
     enabled      integer DEFAULT 1,
-    color_config text                -- for 'price_color': JSON { bands:[{up_to_p,hue}…], saturation, brightness }
+    color_config text,              -- for 'price_color': JSON { bands:[{up_to_p,hue}…], saturation, brightness }
+    invert       integer DEFAULT 0, -- flip the strategy's boolean (e.g. on when NOT cheap)
+    comfort_c    real,              -- setpoint mode (TRV): target °C when the rule is active
+    setback_c    real               -- setpoint mode (TRV): target °C otherwise
 );
 
 CREATE TABLE IF NOT EXISTS [rule_devices] (
@@ -182,7 +185,7 @@ Create the table in the local D1 database (stored in `.wrangler/`):
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
-npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1, color_config text)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1, color_config text, invert integer DEFAULT 0, comfort_c real, setback_c real)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
@@ -240,7 +243,7 @@ A `:id` may be a `device_id`, an **outlet id** (see [Power strips](#power-strips
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/squid/rules` | Lists all rate-based automation rules, each with its tagged `devices`. |
-| `POST` | `/api/squid/rules` | Creates a rule. Body: `{"name?","strategy","threshold_p"\|"hours"\|"efficiency","enabled?","device_ids?":[...]}`. For `price_color`: `bands` or `cheap_p`/`expensive_p` (+ optional `saturation`, `brightness`) — see [Price-status colour indicator](#price-status-colour-indicator). Returns the generated `rule_id`. `device_ids` accept a deviceId, outlet id or unique name (resolved + validated like the tag endpoint); an id unsuitable for the strategy is rejected (409). |
+| `POST` | `/api/squid/rules` | Creates a rule. Body: `{"name?","strategy","threshold_p"\|"hours"\|"efficiency","enabled?","device_ids?":[...]}`. Optional `invert` (flip the decision) and `comfort_c`+`setback_c` (setpoint mode → drives a TRV; see [Heating](#heating-trv-setpoints)). For `price_color`: `bands` or `cheap_p`/`expensive_p` (+ optional `saturation`, `brightness`) — see [Price-status colour indicator](#price-status-colour-indicator). Returns the generated `rule_id`. `device_ids` accept a deviceId, outlet id or unique name (resolved + validated like the tag endpoint); an id unsuitable for the strategy is rejected (409). |
 | `GET` | `/api/squid/rules/:ruleId` | Returns one rule with its tagged devices. |
 | `PUT` | `/api/squid/rules/:ruleId` | Updates a rule's definition (not its device tags). |
 | `DELETE` | `/api/squid/rules/:ruleId` | Deletes a rule and all its device tags. |
@@ -329,6 +332,11 @@ switched **on if _any_ of them wants it on** (any-on). The strategies are:
 | `price_color` | `bands` / `cheap_p`+`expensive_p` | Not an on/off rule: drives a tagged **bulb's colour** from the current price, as a glanceable "is now a good time?" indicator. See [Price-status colour indicator](#price-status-colour-indicator). |
 
 The first three switch a load **on/off**. `price_color` instead colours a bulb; its bulbs are held on showing the band colour and are not part of the any-on on/off logic.
+
+Two modifiers apply on top of the on/off strategies:
+
+- **`invert`** (`true`/`false`) flips the strategy's decision — e.g. `cheaper_than_gas` + `invert` is on (or "comfort", below) when electricity is *dearer* than gas, not cheaper.
+- **Setpoint mode** (`comfort_c` + `setback_c`, °C) makes the rule drive a **thermostat / TRV** instead of a relay: when the (possibly inverted) strategy is active the TRV targets `comfort_c`, otherwise `setback_c`. See [Heating (TRV setpoints)](#heating-trv-setpoints).
 
 #### Setup
 
@@ -498,6 +506,42 @@ Tagging only accepts a colour-capable bulb: a non-bulb (plug/switch/outlet) is
 rejected (409), as is a bulb whose cached `caps.color` is `false`. A bulb whose
 capabilities aren't cached yet is accepted, and the evaluate pass skips it
 (`no colour support`) if it turns out not to support colour.
+
+#### Heating (TRV setpoints)
+
+A rule with `comfort_c` + `setback_c` (and an on/off strategy to gate them) is a
+**setpoint rule** that drives a thermostatic radiator valve's target temperature
+instead of switching a relay. Combined with `invert`, it complements a heat pump:
+the *same* price condition that turns the heat pump on sets the gas radiator down,
+and vice-versa.
+
+```bash
+# Heat pump: run when electricity beats gas (COP ~3 vs a 90% boiler)
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"name":"Heat pump","strategy":"cheaper_than_gas","efficiency":3.3,"device_ids":["<heat-pump plug>"]}' \
+  https://<worker>/api/squid/rules
+
+# Gas TRV: the inverse — comfort (21°) when electricity is DEARER than gas, setback
+# (16°) when electricity is cheaper (let the heat pump do the work).
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"name":"Gas radiator","strategy":"cheaper_than_gas","efficiency":3.3,"invert":true,"comfort_c":21,"setback_c":16,"device_ids":["<TRV>"]}' \
+  https://<worker>/api/squid/rules
+```
+
+A setpoint rule may only be tagged to a thermostat; on/off and colour rules may
+not target one. The evaluate pass computes the target temperature each half hour
+and logs it.
+
+> **⚠️ Not yet operational.** KE100-class TRVs (via a KH100 hub) speak the
+> **SMART/Tapo** protocol — `set_device_info {"target_temp": …}` over an encrypted
+> `securePassthrough` after a Tapo login — which is a different transport from the
+> Kasa IOT passthrough Squid uses for plugs/strips/bulbs. The rule model, the
+> inverted-`cheaper_than_gas` logic and the setpoint computation are all in place
+> and tested, but the actual TRV write is **gated** (`kasaSetTargetTemp` throws and
+> the evaluate pass reports the intended temperature without sending) until a Tapo
+> cloud transport is added. That transport — a separate `appType` login +
+> `securePassthrough` + `control_child` — also unlocks Tapo plugs/bulbs, and is the
+> recommended next step.
 
 #### On-device firmware rules
 
