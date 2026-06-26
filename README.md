@@ -58,7 +58,7 @@ Update `wrangler.toml` with your D1 `database_id`:
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
-   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1, color_config text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
@@ -96,14 +96,15 @@ CREATE TABLE IF NOT EXISTS [tariffs] (
 -- Many devices per rule, and many rules per device (a device is ON if ANY of
 -- its rules wants it on).
 CREATE TABLE IF NOT EXISTS [rules] (
-    rule_id     text PRIMARY KEY,  -- generated UUID (migrated rules reuse the old device_id)
-    user_id     text,
-    name        text,              -- display label for the rule
-    strategy    text,              -- 'threshold' | 'cheapest_hours' | 'cheaper_than_gas'
-    threshold_p real,              -- for 'threshold': switch on at/below this price (pence)
-    hours       real,              -- for 'cheapest_hours': keep on during the cheapest N hours of the day
-    efficiency  real DEFAULT 1,    -- for 'cheaper_than_gas': on when elec price <= gas price x efficiency
-    enabled     integer DEFAULT 1
+    rule_id      text PRIMARY KEY,  -- generated UUID (migrated rules reuse the old device_id)
+    user_id      text,
+    name         text,              -- display label for the rule
+    strategy     text,              -- 'threshold' | 'cheapest_hours' | 'cheaper_than_gas' | 'price_color'
+    threshold_p  real,              -- for 'threshold': switch on at/below this price (pence)
+    hours        real,              -- for 'cheapest_hours': keep on during the cheapest N hours of the day
+    efficiency   real DEFAULT 1,    -- for 'cheaper_than_gas': on when elec price <= gas price x efficiency
+    enabled      integer DEFAULT 1,
+    color_config text                -- for 'price_color': JSON { bands:[{up_to_p,hue}…], saturation, brightness }
 );
 
 CREATE TABLE IF NOT EXISTS [rule_devices] (
@@ -133,8 +134,8 @@ CREATE TABLE IF NOT EXISTS [tplink_tokens] (
 -- to the metadata-only endpoints so they don't call the cloud per request.
 CREATE TABLE IF NOT EXISTS [device_cache] (
     user_id    text PRIMARY KEY,
-    json       text,            -- the getDeviceList array; power strips also carry a
-                                -- learned `children` array of outlets (id/alias/state)
+    json       text,            -- the getDeviceList array; enriched from get_sysinfo with a
+                                -- strip's `children` (outlets) and a bulb's `caps` (colour etc.)
     updated_at text
 );
 ```
@@ -181,7 +182,7 @@ Create the table in the local D1 database (stored in `.wrangler/`):
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [gas_rates] (noduplicates text PRIMARY KEY, user_id text, time_start text, time_end text, price text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tariffs] (user_id text PRIMARY KEY, tariff_code text, gas_tariff_code text, gas_price_p real)"
-npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rules] (rule_id text PRIMARY KEY, user_id text, name text, strategy text, threshold_p real, hours real, efficiency real DEFAULT 1, enabled integer DEFAULT 1, color_config text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
@@ -227,9 +228,10 @@ A `:id` may be a `device_id`, an **outlet id** (see [Power strips](#power-strips
 |--------|------|-------------|
 | `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (**live**), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). A power strip is listed as a container (`on: null`, `outlets: N`) followed by one row per outlet (each with `parent_id`, `parent_alias`, and its own `on`). |
 | `GET` | `/api/kasa/devices/:id` | Returns the **live** state of a single device or outlet. A strip parent returns the container with an `outlets` array; an outlet id/name returns just that outlet. |
-| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device or outlet on or off. Body: `{"on": true}`. Logs a `manual` entry. A strip *parent* is rejected (409) — target a specific outlet. |
+| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device or outlet on or off. Body: `{"on": true}`. Works for plugs, switches, strip outlets **and bulbs** (bulbs switch via the lighting service). Logs a `manual` entry. A strip *parent* is rejected (409) — target a specific outlet. |
+| `POST` | `/api/kasa/devices/:id/light` | Sets a **bulb's** colour / brightness / on-off. Body: any of `on` (bool), `hue` (0–360), `saturation` (0–100), `brightness` (0–100), `color_temp` (K; `0`/omitted = colour mode). Bulbs only (else 409). |
 | `GET` | `/api/kasa/devices/:id/usage` | Reads raw energy data from a device's (or outlet's) emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
-| `GET` | `/api/kasa/devices/:id/energy` | Live **energy use** (Kasa app's Energy Use view). Returns `realtime` (`power_w`, `voltage_v`, `current_a`), `today` (`total_wh`), `last_7_days` and `last_30_days` (each `total_wh` + `daily_avg_wh`). From the emeter module. On a strip, address a specific outlet (per-outlet emeter, e.g. HS300). |
+| `GET` | `/api/kasa/devices/:id/energy` | Live **energy use** (Kasa app's Energy Use view). Returns `realtime` (`power_w`, `voltage_v`, `current_a`), `today` (`total_wh`), `last_7_days` and `last_30_days` (each `total_wh` + `daily_avg_wh`). From the emeter module. On a strip, address a specific outlet (per-outlet emeter, e.g. HS300); bulbs have no emeter (409). |
 | `GET` | `/api/kasa/devices/:id/runtime` | Live **runtime** (Kasa app's Runtime view). Returns `realtime` (`current_runtime_s` = current on-session), `today` (`total_min`), `last_7_days` and `last_30_days` (each `total_min` + `daily_avg_min`). From `get_sysinfo.on_time` + the `schedule` module's per-day minutes. On a strip, address a specific outlet. |
 | `GET` | `/api/kasa/devices/:id/rules` | Reads the on-device firmware rules for a device or outlet (`schedule`, `count_down`, `anti_theft`). Note: this only surfaces device-level rules set in the Kasa app's "Device" section — cloud Smart Actions (geofencing, device triggers) are **not** retrievable via this API. |
 
@@ -238,13 +240,13 @@ A `:id` may be a `device_id`, an **outlet id** (see [Power strips](#power-strips
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/squid/rules` | Lists all rate-based automation rules, each with its tagged `devices`. |
-| `POST` | `/api/squid/rules` | Creates a rule. Body: `{"name?","strategy","threshold_p"\|"hours"\|"efficiency","enabled?","device_ids?":[...]}`. Returns the generated `rule_id`. `device_ids` must be canonical deviceIds; use the tag endpoint to add by alias. |
+| `POST` | `/api/squid/rules` | Creates a rule. Body: `{"name?","strategy","threshold_p"\|"hours"\|"efficiency","enabled?","device_ids?":[...]}`. For `price_color`: `bands` or `cheap_p`/`expensive_p` (+ optional `saturation`, `brightness`) — see [Price-status colour indicator](#price-status-colour-indicator). Returns the generated `rule_id`. `device_ids` accept a deviceId, outlet id or unique name (resolved + validated like the tag endpoint); an id unsuitable for the strategy is rejected (409). |
 | `GET` | `/api/squid/rules/:ruleId` | Returns one rule with its tagged devices. |
 | `PUT` | `/api/squid/rules/:ruleId` | Updates a rule's definition (not its device tags). |
 | `DELETE` | `/api/squid/rules/:ruleId` | Deletes a rule and all its device tags. |
-| `POST` | `/api/squid/rules/:ruleId/devices/:id` | **Tags** a device onto the rule (`:id` = deviceId or alias). |
+| `POST` | `/api/squid/rules/:ruleId/devices/:id` | **Tags** a device/outlet onto the rule (`:id` = deviceId, outlet id or name). Rejected (409) if unsuitable for the rule's strategy — a strip *parent* (any strategy), or a non-colour device on a `price_color` rule. |
 | `DELETE` | `/api/squid/rules/:ruleId/devices/:id` | **Untags** a device from the rule, leaving the rule intact. |
-| `GET` | `/api/squid/forecast` | Read-only preview of which half-hour slots each enabled rule would fire, plus the `devices` it is tagged to, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. Each result includes `on_slots`, `on_hours` and the qualifying `slots`. |
+| `GET` | `/api/squid/forecast` | Read-only preview of which half-hour slots each enabled rule would fire, plus the `devices` it is tagged to, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. On/off rules include `on_slots`, `on_hours` and the qualifying `slots`; `price_color` rules instead include `bands` (`hue`, `up_to_p`, `slots`, `hours` per colour band). |
 | `POST` | `/api/squid/evaluate` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. |
 | `GET` | `/api/squid/log` | Returns recent switching history from `device_log` (newest first). Supports `?limit=` (max 200). |
 
@@ -317,14 +319,16 @@ on-device firmware rules), while `squid/` holds the rate-based automation
 Automation is defined by **rules** (the `rules` table). Devices are **tagged**
 onto a rule (`rule_devices`) — a rule can drive **many devices**, and a device
 can belong to **many rules**. When a device is tagged to several rules it is
-switched **on if _any_ of them wants it on** (any-on). Three strategies are
-supported:
+switched **on if _any_ of them wants it on** (any-on). The strategies are:
 
 | Strategy | Fields | Behaviour |
 |----------|--------|-----------|
 | `threshold` | `threshold_p` | On when the current half-hourly price is at or below `threshold_p` pence, off otherwise. |
 | `cheapest_hours` | `hours` | On during the cheapest `hours` hours of the current (UTC) day, off otherwise. Good for charging-type loads. |
 | `cheaper_than_gas` | `efficiency` | On when the current electricity price is at or below `gas_price × efficiency` pence, off otherwise. `efficiency` (default `1`) is the device's output-per-unit advantage over gas — e.g. `~3.3` for a heat pump (COP 3) vs a 90% boiler, `~1.1` for a resistive heater. The gas price is the `gas_price_override_p` if set, else the flat gas unit rate auto-fetched from your Octopus gas tariff (see `GET /api/octopus/tariff`). |
+| `price_color` | `bands` / `cheap_p`+`expensive_p` | Not an on/off rule: drives a tagged **bulb's colour** from the current price, as a glanceable "is now a good time?" indicator. See [Price-status colour indicator](#price-status-colour-indicator). |
+
+The first three switch a load **on/off**. `price_color` instead colours a bulb; its bulbs are held on showing the band colour and are not part of the any-on on/off logic.
 
 #### Setup
 
@@ -426,6 +430,69 @@ its own switchable load**.
   ```
 - **Energy / runtime.** Read per outlet too (the HS300 has a per-outlet emeter);
   `energy`/`runtime`/`usage` on a strip parent return a 409 asking for an outlet.
+
+#### Bulbs & lights
+
+Smart bulbs and light strips (`IOT.SMARTBULB`, e.g. KL130, KL430) are supported
+as on/off loads just like plugs — tag them to any on/off rule and they switch on
+the lighting service instead of a relay. They generally have no energy meter, so
+`/energy` returns a 409. Their capability flags (`caps`: `color`, `dimmable`,
+`variable_color_temp`) are read from `get_sysinfo` once and cached in the snapshot
+(they don't change) and reported on the device endpoints; a colour request to a
+non-colour bulb (here or via a `price_color` rule) is rejected/skipped. You can
+also drive a bulb's colour, brightness and on/off directly:
+
+```bash
+# Turn on, full-brightness green
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"on":true,"hue":120,"saturation":100,"brightness":100}' \
+  https://<worker>/api/kasa/devices/Lamp/light
+
+# Warm white at 40%
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"color_temp":2700,"brightness":40}' \
+  https://<worker>/api/kasa/devices/Lamp/light
+```
+
+#### Price-status colour indicator
+
+A `price_color` rule turns a colour bulb into a glanceable price gauge — green
+when power is cheap, red when it's dear — so you can tell at a glance whether now
+is a good time to run the dishwasher, washing machine or other flexible load.
+
+Bands are **absolute pence cutoffs** (ascending; the last band is the catch-all).
+The quickest way is the `cheap_p` / `expensive_p` shorthand, which expands to the
+green / amber / red traffic light:
+
+```bash
+# Green ≤ 10p, amber ≤ 20p, red above — applied to a colour bulb
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"name":"Price light","strategy":"price_color","cheap_p":10,"expensive_p":20,"device_ids":["<bulb deviceId>"]}' \
+  https://<worker>/api/squid/rules
+```
+
+For full control, give explicit `bands` (each `up_to_p` + `hue` 0–360; omit
+`up_to_p` on the last for the catch-all) plus optional `saturation` / `brightness`
+(0–100, applied to every band):
+
+```bash
+curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+  -d '{"name":"Price light","strategy":"price_color",
+       "bands":[{"up_to_p":5,"hue":120},{"up_to_p":15,"hue":40},{"hue":0}],
+       "saturation":100,"brightness":70,"device_ids":["<bulb deviceId>"]}' \
+  https://<worker>/api/squid/rules
+```
+
+The half-hourly evaluate cron re-colours the bulb as the price moves (only
+sending a command when the band actually changes), and holds it on. A bulb driven
+by a `price_color` rule is excluded from on/off switching, so don't also tag it to
+a load-switching rule. `GET /api/squid/forecast` shows how many hours fall in each
+band over today + tomorrow.
+
+Tagging only accepts a colour-capable bulb: a non-bulb (plug/switch/outlet) is
+rejected (409), as is a bulb whose cached `caps.color` is `false`. A bulb whose
+capabilities aren't cached yet is accepted, and the evaluate pass skips it
+(`no colour support`) if it turns out not to support colour.
 
 #### On-device firmware rules
 

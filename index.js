@@ -5,11 +5,30 @@
  * @property {string} [alias]
  * @property {string} appServerUrl
  * @property {string} [deviceModel]
+ * @property {string} [deviceType] - e.g. "IOT.SMARTPLUGSWITCH" or "IOT.SMARTBULB".
  * @property {number} status - 1 when the device is online.
  * @property {KasaOutlet[]} [children] - persisted outlets for a power strip
  *   (HS300/KP303/EP40…). Not returned by `getDeviceList`; learned from a
  *   `get_sysinfo` and kept in the snapshot so names/ids can be resolved and
  *   overlaid without a live call. See {@link refreshDeviceSnapshot}.
+ * @property {KasaCaps} [caps] - bulb capability flags, learned from `get_sysinfo`
+ *   and cached (they don't change). Lets colour ops be guarded without a live read.
+ */
+
+/**
+ * A smart bulb's (immutable) capability flags, from `get_sysinfo`.
+ * @typedef {Object} KasaCaps
+ * @property {boolean} color - supports hue/saturation colour.
+ * @property {boolean} dimmable - supports brightness.
+ * @property {boolean} variable_color_temp - supports white colour temperature.
+ */
+
+/**
+ * Facts learned from a `get_sysinfo` that are worth caching in the snapshot: a
+ * strip's outlets and a bulb's capability flags.
+ * @typedef {Object} DeviceFacts
+ * @property {KasaOutlet[]} [children]
+ * @property {KasaCaps} [caps]
  */
 
 /**
@@ -313,18 +332,19 @@ async function readDeviceSnapshot(env) {
 /**
  * Fetches the live device list and persists it as the metadata snapshot.
  * Called by the cron (reusing its existing getDeviceList) and on cold start.
- * `getDeviceList` does not return a strip's outlets, so any previously-learned
- * `children` (from a `get_sysinfo` on a live read or evaluate) are carried over
- * rather than dropped — keeping outlet names/ids resolvable between strip reads.
+ * `getDeviceList` returns neither a strip's outlets nor a bulb's caps, so any
+ * previously-learned `children`/`caps` (from a `get_sysinfo` on a live read or
+ * evaluate) are carried over rather than dropped — keeping them resolvable
+ * between reads.
  * @param {Env} env
  * @returns {Promise<KasaDevice[]>}
  */
 async function refreshDeviceSnapshot(env) {
   const [devices, prev] = await Promise.all([kasaDeviceList(env), readDeviceSnapshot(env).catch(() => null)])
-  const childrenById = new Map((prev || []).map(d => [d.deviceId, d.children]))
+  const prevById = new Map((prev || []).map(d => [d.deviceId, d]))
   const merged = devices.map(d => {
-    const children = childrenById.get(d.deviceId)
-    return children ? { ...d, children } : d
+    const p = prevById.get(d.deviceId)
+    return p ? { ...d, ...(p.children ? { children: p.children } : {}), ...(p.caps ? { caps: p.caps } : {}) } : d
   })
   await persistDeviceSnapshot(env, merged)
   return merged
@@ -373,22 +393,46 @@ function childrenFromSysinfo(sysinfo) {
 }
 
 /**
- * Folds freshly-read outlets for one or more strips into the snapshot, so outlet
- * names/ids resolve and overlay without another live call. A no-op when nothing
- * changed or the snapshot isn't populated yet. Best-effort: never throws.
- * @param {Env} env
- * @param {Map<string, KasaOutlet[]>} childrenByDevice - keyed by parent deviceId.
+ * Extracts a bulb's capability flags from a `get_sysinfo`, or undefined for a
+ * device that doesn't report them (plugs/switches/strips).
+ * @param {any} sysinfo - the `system.get_sysinfo` object.
+ * @returns {KasaCaps | undefined}
  */
-async function persistOutlets(env, childrenByDevice) {
-  if (!childrenByDevice.size) return
+function capsFromSysinfo(sysinfo) {
+  if (!sysinfo || (sysinfo.is_color == null && sysinfo.is_dimmable == null && sysinfo.is_variable_color_temp == null)) {
+    return undefined
+  }
+  return { color: !!sysinfo.is_color, dimmable: !!sysinfo.is_dimmable, variable_color_temp: !!sysinfo.is_variable_color_temp }
+}
+
+/**
+ * The cacheable facts from a `get_sysinfo`: a strip's outlets and a bulb's caps.
+ * @param {any} sysinfo - the `system.get_sysinfo` object.
+ * @returns {DeviceFacts}
+ */
+function factsFromSysinfo(sysinfo) {
+  return { children: childrenFromSysinfo(sysinfo), caps: capsFromSysinfo(sysinfo) }
+}
+
+/**
+ * Folds freshly-read facts (strip outlets, bulb caps) into the snapshot, so they
+ * resolve/guard without another live call. A no-op when nothing changed or the
+ * snapshot isn't populated yet. Best-effort: never throws.
+ * @param {Env} env
+ * @param {Map<string, DeviceFacts>} factsByDevice - keyed by deviceId.
+ */
+async function persistDeviceFacts(env, factsByDevice) {
+  if (!factsByDevice.size) return
   const devices = await readDeviceSnapshot(env).catch(() => null)
   if (!devices) return
   let changed = false
   const updated = devices.map(d => {
-    const children = childrenByDevice.get(d.deviceId)
-    if (!children || !children.length) return d // single-relay device: nothing to fold in
-    changed = true
-    return { ...d, children }
+    const f = factsByDevice.get(d.deviceId)
+    if (!f) return d
+    let next = d
+    if (f.children && f.children.length) { next = { ...next, children: f.children }; changed = true }
+    if (f.caps) { next = { ...next, caps: f.caps }; changed = true }
+    return next
   })
   if (changed) await persistDeviceSnapshot(env, updated).catch(() => {})
 }
@@ -414,10 +458,28 @@ async function kasaPassthrough(env, dev, command, childId) {
   return JSON.parse(result.responseData)
 }
 
+// Smart-bulb lighting service: bulbs (IOT.SMARTBULB) switch and colour via
+// `transition_light_state`, a different path from the plug/switch relay.
+const LIGHT_SERVICE = "smartlife.iot.smartbulb.lightingservice"
+
+// Defaults for the price_color indicator: a green/amber/red traffic light.
+const DEFAULT_TRAFFIC_HUES = [120, 40, 0] // green, amber, red
+const DEFAULT_SATURATION = 100
+const DEFAULT_BRIGHTNESS = 70
+
 /**
- * The relay state of a device or one of its outlets, from a `get_sysinfo`.
- * A power strip has no top-level `relay_state`; each outlet carries its own in
- * `children[]`. Returns null when the outlet can't be found.
+ * @param {KasaDevice} dev
+ * @returns {boolean} true for a smart bulb / light strip.
+ */
+function isBulb(dev) {
+  return dev.deviceType === "IOT.SMARTBULB"
+}
+
+/**
+ * The on/off state of a device or one of its outlets, from a `get_sysinfo`. A
+ * power strip has no top-level `relay_state` (each outlet carries its own in
+ * `children[]`); a bulb has no relay at all and reports `light_state.on_off`.
+ * Returns null when unknown.
  * @param {any} sysinfo - the `system.get_sysinfo` object.
  * @param {string | null} [childId]
  * @returns {number | null} 0 (off), 1 (on), or null when unknown.
@@ -427,7 +489,7 @@ function relayStateOf(sysinfo, childId) {
     const child = (sysinfo.children || []).find((/** @type {any} */ c) => c.id === childId)
     return child ? child.state : null
   }
-  return sysinfo.relay_state ?? null
+  return sysinfo.relay_state ?? sysinfo.light_state?.on_off ?? null
 }
 
 /**
@@ -442,13 +504,38 @@ async function kasaReadState(env, dev, childId) {
 }
 
 /**
+ * Switches a device or outlet on/off. Bulbs use the lighting service; everything
+ * else uses the relay (optionally scoped to a strip outlet).
  * @param {Env} env
  * @param {KasaDevice} dev
  * @param {boolean} on
  * @param {string | null} [childId]
  */
 async function kasaSetState(env, dev, on, childId) {
-  await kasaPassthrough(env, dev, { system: { set_relay_state: { state: on ? 1 : 0 } } }, childId)
+  if (isBulb(dev)) {
+    await kasaPassthrough(env, dev, { [LIGHT_SERVICE]: { transition_light_state: { on_off: on ? 1 : 0, transition_period: 0 } } })
+  } else {
+    await kasaPassthrough(env, dev, { system: { set_relay_state: { state: on ? 1 : 0 } } }, childId)
+  }
+}
+
+/**
+ * Sets a bulb's colour (HSB). Hue 0–360, saturation/brightness 0–100. Forces
+ * colour mode (`color_temp: 0`) and turns the bulb on so the colour shows.
+ * @param {Env} env
+ * @param {KasaDevice} dev
+ * @param {{ hue: number, saturation: number, brightness: number }} colour
+ */
+async function kasaSetColor(env, dev, colour) {
+  await kasaPassthrough(env, dev, {
+    [LIGHT_SERVICE]: {
+      transition_light_state: {
+        on_off: 1, color_temp: 0,
+        hue: colour.hue, saturation: colour.saturation, brightness: colour.brightness,
+        transition_period: 500,
+      },
+    },
+  })
 }
 
 /**
@@ -629,7 +716,7 @@ async function ruleDesired(env, rule, rate, nowISO) {
 async function evaluateDevices(env) {
   /** @type {{ results: any[] }} */
   const { results: pairs } = await env.DATABASE.prepare(
-    `SELECT r.rule_id, r.name, r.strategy, r.threshold_p, r.hours, r.efficiency, rd.device_id
+    `SELECT r.rule_id, r.name, r.strategy, r.threshold_p, r.hours, r.efficiency, r.color_config, rd.device_id
      FROM rules r JOIN rule_devices rd ON rd.rule_id = r.rule_id
      WHERE r.user_id = ? AND r.enabled = 1`
   ).bind(env.USER_ID).all()
@@ -643,10 +730,16 @@ async function evaluateDevices(env) {
   const rate = await currentRate(env, nowISO)
   const byId = new Map(liveDevices.map(d => [d.deviceId, d]))
 
-  // Group the rules that apply to each tagged load (deviceId or outlet id).
+  // price_color rules drive a bulb's *colour*, not on/off — handle them in a
+  // separate pass, and keep their bulbs out of the any-on switching below.
+  const colorPairs = pairs.filter(p => p.strategy === "price_color")
+  const indicatorDeviceIds = new Set(colorPairs.map(p => p.device_id))
+
+  // Group the on/off rules that apply to each tagged load (deviceId or outlet id).
   /** @type {Map<string, any[]>} */
   const rulesByTarget = new Map()
   for (const p of pairs) {
+    if (p.strategy === "price_color" || indicatorDeviceIds.has(p.device_id)) continue
     let list = rulesByTarget.get(p.device_id)
     if (!list) { list = []; rulesByTarget.set(p.device_id, list) }
     list.push(p)
@@ -659,7 +752,7 @@ async function evaluateDevices(env) {
     if (!sysinfoCache.has(dev.deviceId)) {
       const s = await readSysinfo(env, dev)
       sysinfoCache.set(dev.deviceId, s)
-      if (s) await persistOutlets(env, new Map([[dev.deviceId, childrenFromSysinfo(s)]]))
+      if (s) await persistDeviceFacts(env, new Map([[dev.deviceId, factsFromSysinfo(s)]]))
     }
     return sysinfoCache.get(dev.deviceId)
   }
@@ -698,6 +791,44 @@ async function evaluateDevices(env) {
       actions.push({ device_id: targetId, alias, action: desired ? "on" : "off", reason })
     } else {
       actions.push({ device_id: targetId, alias, action: "unchanged", reason })
+    }
+  }
+
+  // Colour-indicator pass: set each tagged bulb's hue from the current price.
+  // One colour rule per bulb (first wins if tagged to several).
+  /** @type {Map<string, any>} */
+  const colorRuleByDevice = new Map()
+  for (const p of colorPairs) if (!colorRuleByDevice.has(p.device_id)) colorRuleByDevice.set(p.device_id, p)
+  for (const [deviceId, rule] of colorRuleByDevice) {
+    const dev = byId.get(deviceId)
+    if (!dev) { actions.push({ device_id: deviceId, skipped: "not found" }); continue }
+    const alias = dev.alias
+    if (!isBulb(dev)) { actions.push({ device_id: deviceId, alias, skipped: "not a bulb" }); continue }
+    if (dev.status !== 1) { actions.push({ device_id: deviceId, alias, skipped: "offline" }); continue }
+    if (!rate) { actions.push({ device_id: deviceId, alias, skipped: "no rate data" }); continue }
+    /** @type {any} */
+    let config = null
+    try { config = JSON.parse(rule.color_config) } catch { /* malformed */ }
+    if (!config) { actions.push({ device_id: deviceId, alias, skipped: "no colour config" }); continue }
+
+    const price = parseFloat(rate.price)
+    const target = colorBandFor(price, config)
+    const reason = `${rule.name || rule.rule_id}: ${price}p → hue ${target.hue}`
+    const sysinfo = await readSys(dev)
+    // Capability flags are cached from this read; skip a bulb that can't do colour.
+    if (capsFromSysinfo(sysinfo)?.color === false) { actions.push({ device_id: deviceId, alias, skipped: "no colour support" }); continue }
+    const ls = sysinfo?.light_state
+    if (!ls) { actions.push({ device_id: deviceId, alias, skipped: "state unavailable" }); continue }
+
+    // Set only when off, in white mode, or showing a different hue.
+    if (ls.on_off !== 1 || (ls.color_temp ?? 0) !== 0 || ls.hue !== target.hue) {
+      await kasaSetColor(env, dev, target)
+      await env.DATABASE.prepare(
+        "INSERT INTO device_log (device_id, user_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(deviceId, env.USER_ID, nowISO, "color", price, reason).run()
+      actions.push({ device_id: deviceId, alias, action: "color", hue: target.hue, reason })
+    } else {
+      actions.push({ device_id: deviceId, alias, action: "unchanged", reason })
     }
   }
   return actions
@@ -937,30 +1068,32 @@ async function handleKasaDevices(_request, env, _ctx, _params) {
   // Live read — and persist the snapshot from this fetch so the metadata
   // endpoints stay fresh between cron runs (relay state below is still live).
   const devices = await refreshDeviceSnapshot(env)
-  /** @type {Map<string, KasaOutlet[]>} */
+  /** @type {Map<string, DeviceFacts>} */
   const learned = new Map()
   const results = (await Promise.all(devices.map(async d => {
     const base = { alias: d.alias, model: d.deviceModel, status: d.status }
     // Offline: can't read live; surface the device (and any known outlets) as unknown.
     if (d.status !== 1) {
       return [
-        { device_id: d.deviceId, ...base, on: null, ...(d.children?.length ? { outlets: d.children.length } : {}) },
+        { device_id: d.deviceId, ...base, ...(d.caps ? { caps: d.caps } : {}), on: null, ...(d.children?.length ? { outlets: d.children.length } : {}) },
         ...(d.children || []).map(c => ({ device_id: c.id, parent_id: d.deviceId, parent_alias: d.alias, alias: c.alias, model: d.deviceModel, status: d.status, on: null })),
       ]
     }
     const sysinfo = await readSysinfo(env, d)
+    if (sysinfo) learned.set(d.deviceId, factsFromSysinfo(sysinfo))
     const children = sysinfo && sysinfo.children
     if (children && children.length) {
-      learned.set(d.deviceId, childrenFromSysinfo(sysinfo))
       return [
         { device_id: d.deviceId, ...base, on: null, outlets: children.length },
         ...children.map((/** @type {any} */ c) => ({ device_id: c.id, parent_id: d.deviceId, parent_alias: d.alias, alias: c.alias, model: d.deviceModel, status: d.status, on: c.state === 1 })),
       ]
     }
-    // Single-relay device. null = read failed.
-    return [{ device_id: d.deviceId, ...base, on: sysinfo ? sysinfo.relay_state === 1 : null }]
+    // Single relay or bulb. null = read failed / unknown.
+    const caps = capsFromSysinfo(sysinfo)
+    const s = sysinfo ? relayStateOf(sysinfo, null) : null
+    return [{ device_id: d.deviceId, ...base, ...(caps ? { caps } : {}), on: s == null ? null : s === 1 }]
   }))).flat()
-  await persistOutlets(env, learned)
+  await persistDeviceFacts(env, learned)
   return Response.json({ results })
 }
 
@@ -987,7 +1120,7 @@ async function handleKasaDevice(_request, env, _ctx, params) {
     return Response.json({ device_id: childId ?? dev.deviceId, alias: childId ? target.childAlias : dev.alias, ...outletFields, model: dev.deviceModel, status: dev.status, on: null })
   }
   const sysinfo = await readSysinfo(env, dev)
-  if (sysinfo) await persistOutlets(env, new Map([[dev.deviceId, childrenFromSysinfo(sysinfo)]]))
+  if (sysinfo) await persistDeviceFacts(env, new Map([[dev.deviceId, factsFromSysinfo(sysinfo)]]))
   const children = sysinfo && sysinfo.children
 
   // Strip parent (no specific outlet): return the container and its outlets.
@@ -1001,8 +1134,10 @@ async function handleKasaDevice(_request, env, _ctx, params) {
   const alias = childId
     ? (children?.find((/** @type {any} */ c) => c.id === childId)?.alias ?? target.childAlias)
     : dev.alias
+  const caps = capsFromSysinfo(sysinfo)
   return Response.json({
     device_id: childId ?? dev.deviceId, alias, ...outletFields, model: dev.deviceModel, status: dev.status,
+    ...(caps ? { caps } : {}),
     on: state == null ? null : state === 1,
   })
 }
@@ -1029,7 +1164,7 @@ async function handleKasaDeviceState(request, env, _ctx, params) {
   // Detect a power strip so an ambiguous whole-strip switch is refused rather
   // than sent (the strip has no single relay) — and learn its outlets.
   const sysinfo = await readSysinfo(env, dev)
-  if (sysinfo) await persistOutlets(env, new Map([[dev.deviceId, childrenFromSysinfo(sysinfo)]]))
+  if (sysinfo) await persistDeviceFacts(env, new Map([[dev.deviceId, factsFromSysinfo(sysinfo)]]))
   if (!childId && sysinfo?.children?.length) {
     const ids = sysinfo.children.map((/** @type {any} */ c) => c.id).join(", ")
     return new Response(`This is a power strip; switch a specific outlet instead (${ids})`, { status: 409 })
@@ -1041,6 +1176,46 @@ async function handleKasaDeviceState(request, env, _ctx, params) {
     "INSERT INTO device_log (device_id, user_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
   ).bind(id, env.USER_ID, nowISO, body.on ? "on" : "off", null, "manual").run()
   return Response.json({ device_id: id, alias: childId ? target.childAlias : dev.alias, on: body.on })
+}
+
+/**
+ * POST /api/kasa/devices/:id/light — set a bulb's colour / brightness / on-off
+ * directly. Body: any of `on` (bool), `hue` (0–360), `saturation` (0–100),
+ * `brightness` (0–100), `color_temp` (K, 0 = colour mode). Bulbs only.
+ * @param {Request} request
+ * @param {Env} env
+ * @param {ExecutionContext} _ctx
+ * @param {Record<string, string>} params
+ * @returns {Promise<Response>}
+ */
+async function handleKasaDeviceLight(request, env, _ctx, params) {
+  const body = await request.json()
+  const t = await resolveForRead(env, params.id)
+  if (t instanceof Response) return t
+  const { device: dev } = t
+  if (!isBulb(dev)) return new Response("Not a bulb; use /state for plugs, switches and outlets", { status: 409 })
+  // Cached caps let us reject a colour request on a non-colour bulb up front.
+  const wantsColor = body.hue != null || body.saturation != null
+  if (wantsColor && dev.caps && !dev.caps.color) {
+    return new Response("This bulb doesn't support colour (hue/saturation)", { status: 409 })
+  }
+
+  /** @type {Record<string, number>} */
+  const state = { transition_period: 500 }
+  if (typeof body.on === "boolean") state.on_off = body.on ? 1 : 0
+  if (body.hue != null) { state.hue = body.hue; state.color_temp = 0 } // hue implies colour mode
+  if (body.saturation != null) state.saturation = body.saturation
+  if (body.brightness != null) state.brightness = body.brightness
+  if (body.color_temp != null) state.color_temp = body.color_temp
+  if (Object.keys(state).length === 1) {
+    return new Response("Provide at least one of on, hue, saturation, brightness, color_temp", { status: 400 })
+  }
+  const data = await kasaPassthrough(env, dev, { [LIGHT_SERVICE]: { transition_light_state: state } })
+  const nowISO = new Date().toISOString()
+  await env.DATABASE.prepare(
+    "INSERT INTO device_log (device_id, user_id, ts, action, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
+  ).bind(dev.deviceId, env.USER_ID, nowISO, "light", null, "manual").run()
+  return Response.json({ device_id: dev.deviceId, alias: dev.alias, light_state: data?.[LIGHT_SERVICE]?.transition_light_state ?? null })
 }
 
 /**
@@ -1177,6 +1352,7 @@ async function handleKasaDeviceEnergy(_request, env, _ctx, params) {
   const t = await resolveForRead(env, params.id, { requireOutlet: true })
   if (t instanceof Response) return t
   const { device: dev, childId } = t
+  if (isBulb(dev)) return new Response("No energy monitoring on this device (bulb has no emeter)", { status: 409 })
 
   const now = new Date()
   const [realtimeData, days] = await Promise.all([
@@ -1222,7 +1398,7 @@ async function handleKasaDeviceRuntime(_request, env, _ctx, params) {
     recentDayStat(env, dev, "schedule", now, childId),
   ])
   const sysinfo = sysData.system.get_sysinfo
-  if (childId) await persistOutlets(env, new Map([[dev.deviceId, childrenFromSysinfo(sysinfo)]]))
+  if (childId) await persistDeviceFacts(env, new Map([[dev.deviceId, factsFromSysinfo(sysinfo)]]))
   const onTime = childId
     ? (sysinfo.children || []).find((/** @type {any} */ c) => c.id === childId)?.on_time ?? 0
     : sysinfo.on_time ?? 0
@@ -1244,13 +1420,115 @@ async function handleKasaDeviceRuntime(_request, env, _ctx, params) {
  * @returns {string | null}
  */
 function validateRuleBody(body) {
-  if (!["threshold", "cheapest_hours", "cheaper_than_gas"].includes(body.strategy)) {
-    return "strategy must be 'threshold', 'cheapest_hours' or 'cheaper_than_gas'"
+  if (!["threshold", "cheapest_hours", "cheaper_than_gas", "price_color"].includes(body.strategy)) {
+    return "strategy must be 'threshold', 'cheapest_hours', 'cheaper_than_gas' or 'price_color'"
   }
   if (body.strategy === "threshold" && body.threshold_p == null) return "Missing threshold_p"
   if (body.strategy === "cheapest_hours" && body.hours == null) return "Missing hours"
   if (body.efficiency != null && !(body.efficiency > 0)) return "efficiency must be a positive number"
+  if (body.strategy === "price_color") return validateColorBody(body)
   return null
+}
+
+/**
+ * Whether a device/outlet is a valid target for a rule's strategy. Returns an
+ * error message to reject the tag with, or null if allowed.
+ *
+ * - Every strategy: a strip *parent* is rejected (no single relay) — tag outlets.
+ * - The on/off strategies (threshold / cheapest_hours / cheaper_than_gas) drive a
+ *   relay or a bulb's on/off, so they're valid on any non-strip-parent load.
+ * - `price_color` drives a bulb's hue, so it needs a colour-capable bulb: a
+ *   non-bulb (plug/switch/outlet) is rejected outright, and a bulb with cached
+ *   `caps.color === false` is rejected. Unknown caps are allowed (they resolve on
+ *   the next live read; evaluate skips a non-colour bulb either way).
+ * @param {string} strategy
+ * @param {KasaTarget} target
+ * @returns {string | null}
+ */
+function ruleTargetError(strategy, target) {
+  const { device: dev, childId } = target
+  if (!childId && dev.children?.length) {
+    return `This is a power strip; tag a specific outlet instead (${dev.children.map(c => c.id).join(", ")})`
+  }
+  if (strategy === "price_color") {
+    if (childId || !isBulb(dev)) return "price_color needs a colour bulb; this device has no colour"
+    if (dev.caps && !dev.caps.color) return "This bulb doesn't support colour (hue/saturation)"
+  }
+  return null
+}
+
+/**
+ * Validates the colour fields of a price_color rule. Either explicit `bands`
+ * (ascending price cutoffs, the last band a catch-all) or the `cheap_p` /
+ * `expensive_p` shorthand must be supplied.
+ * @param {any} body
+ * @returns {string | null}
+ */
+function validateColorBody(body) {
+  const inRange = (/** @type {any} */ v, /** @type {number} */ max) => typeof v === "number" && v >= 0 && v <= max
+  if (Array.isArray(body.bands)) {
+    if (!body.bands.length) return "bands must not be empty"
+    for (const b of body.bands) {
+      if (b.up_to_p != null && typeof b.up_to_p !== "number") return "each band's up_to_p must be a number"
+      if (b.hue != null && !inRange(b.hue, 360)) return "each band's hue must be 0–360"
+      if (b.saturation != null && !inRange(b.saturation, 100)) return "saturation must be 0–100"
+      if (b.brightness != null && !inRange(b.brightness, 100)) return "brightness must be 0–100"
+    }
+    return null
+  }
+  if (body.cheap_p != null || body.expensive_p != null) {
+    if (!(typeof body.cheap_p === "number" && typeof body.expensive_p === "number" && body.cheap_p <= body.expensive_p)) {
+      return "cheap_p and expensive_p must be numbers with cheap_p <= expensive_p"
+    }
+    return null
+  }
+  return "price_color needs 'bands' or both 'cheap_p' and 'expensive_p'"
+}
+
+/**
+ * Builds the stored colour config (JSON) for a price_color rule from a request
+ * body — either explicit `bands` or the `cheap_p`/`expensive_p` traffic-light
+ * shorthand. Fills missing hues from the green/amber/red palette by position.
+ * @param {any} body
+ * @returns {{ bands: { up_to_p: number | null, hue: number }[], saturation: number, brightness: number }}
+ */
+function colorConfigFromBody(body) {
+  const saturation = body.saturation ?? DEFAULT_SATURATION
+  const brightness = body.brightness ?? DEFAULT_BRIGHTNESS
+  /** @type {{ up_to_p?: number, hue?: number }[]} */
+  const raw = Array.isArray(body.bands)
+    ? body.bands
+    : [{ up_to_p: body.cheap_p }, { up_to_p: body.expensive_p }, {}]
+  const last = raw.length - 1
+  const bands = raw.map((b, i) => ({
+    up_to_p: i === last ? null : (b.up_to_p ?? null), // last band is the catch-all
+    hue: b.hue ?? DEFAULT_TRAFFIC_HUES[Math.min(i, DEFAULT_TRAFFIC_HUES.length - 1)],
+  }))
+  return { bands, saturation, brightness }
+}
+
+/**
+ * Picks the colour band a price falls into (absolute pence cutoffs, ascending;
+ * the catch-all band has `up_to_p: null`). Returns hue + saturation/brightness.
+ * @param {number} priceP
+ * @param {{ bands: { up_to_p: number | null, hue: number }[], saturation: number, brightness: number }} config
+ * @returns {{ hue: number, saturation: number, brightness: number }}
+ */
+function colorBandFor(priceP, config) {
+  const band = config.bands[bandIndexFor(priceP, config.bands)]
+  return { hue: band.hue, saturation: config.saturation, brightness: config.brightness }
+}
+
+/**
+ * Index of the band a price falls into (ascending pence cutoffs; the catch-all
+ * band has `up_to_p: null`). Falls back to the last band.
+ * @param {number} priceP
+ * @param {{ up_to_p: number | null }[]} bands
+ * @returns {number}
+ */
+function bandIndexFor(priceP, bands) {
+  const i = bands.findIndex(b => b.up_to_p == null || priceP <= b.up_to_p)
+  return i === -1 ? bands.length - 1 : i
 }
 
 /**
@@ -1274,6 +1552,20 @@ async function ruleDeviceMap(env) {
 }
 
 /**
+ * Shapes a rule DB row for JSON: parses the stored `color_config` into a `color`
+ * object (price_color rules) and drops the raw column.
+ * @param {any} row
+ * @returns {any}
+ */
+function ruleForResponse(row) {
+  const { color_config, ...rest } = row
+  if (color_config) {
+    try { rest.color = JSON.parse(color_config) } catch { /* ignore malformed config */ }
+  }
+  return rest
+}
+
+/**
  * GET /api/squid/rules — list rules, each with its tagged devices.
  * @param {Request} _request
  * @param {Env} env
@@ -1283,17 +1575,19 @@ async function ruleDeviceMap(env) {
  */
 async function handleSquidRulesList(_request, env, _ctx, _params) {
   const { results: rules } = await env.DATABASE.prepare(
-    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled FROM rules WHERE user_id = ?"
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled, color_config FROM rules WHERE user_id = ?"
   ).bind(env.USER_ID).all()
   const devicesByRule = await ruleDeviceMap(env)
-  const enriched = /** @type {any[]} */ (rules).map(r => ({ ...r, devices: devicesByRule.get(r.rule_id) ?? [] }))
+  const enriched = /** @type {any[]} */ (rules).map(r => ({ ...ruleForResponse(r), devices: devicesByRule.get(r.rule_id) ?? [] }))
   return Response.json({ results: enriched })
 }
 
 /**
  * POST /api/squid/rules — create a rule. Body: { name?, strategy,
- * threshold_p|hours|efficiency, enabled?, device_ids?: string[] }. device_ids
- * must be canonical deviceIds; use the tag endpoint to add by alias.
+ * threshold_p|hours|efficiency, enabled?, device_ids?: string[] }. For
+ * `price_color`: `bands` or `cheap_p`/`expensive_p` (+ optional `saturation`,
+ * `brightness`). device_ids must be canonical deviceIds; use the tag endpoint
+ * to add by alias.
  * @param {Request} request
  * @param {Env} env
  * @param {ExecutionContext} _ctx
@@ -1304,21 +1598,38 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
   const body = await request.json()
   const err = validateRuleBody(body)
   if (err) return new Response(err, { status: 400 })
+  // Resolve + validate device_ids up front, before creating the rule, so an
+  // unsuitable device (e.g. a non-colour bulb on a price_color rule) rejects the
+  // whole request rather than leaving a half-tagged rule. Unknown ids are kept
+  // as-is (caught later at evaluate); known ids are stored canonically.
+  const deviceIds = Array.isArray(body.device_ids) ? body.device_ids : []
+  /** @type {string[]} */
+  const resolvedIds = []
+  for (const id of deviceIds) {
+    const { target, ambiguous } = await resolveTarget(env, id)
+    if (ambiguous) return new Response(`Ambiguous device name '${id}'; use the deviceId`, { status: 409 })
+    if (!target) { resolvedIds.push(id); continue }
+    const targetErr = ruleTargetError(body.strategy, target)
+    if (targetErr) return new Response(targetErr, { status: 409 })
+    resolvedIds.push(target.childId ?? target.device.deviceId)
+  }
+
   const rule_id = crypto.randomUUID()
   const efficiency = body.efficiency ?? 1
   const enabled = body.enabled === false ? 0 : 1
+  const color = body.strategy === "price_color" ? colorConfigFromBody(body) : null
   await env.DATABASE.prepare(
-    "INSERT INTO rules (rule_id, user_id, name, strategy, threshold_p, hours, efficiency, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  ).bind(rule_id, env.USER_ID, body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled).run()
-  const deviceIds = Array.isArray(body.device_ids) ? body.device_ids : []
-  for (const deviceId of deviceIds) {
+    "INSERT INTO rules (rule_id, user_id, name, strategy, threshold_p, hours, efficiency, enabled, color_config) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(rule_id, env.USER_ID, body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled, color ? JSON.stringify(color) : null).run()
+  for (const deviceId of resolvedIds) {
     await env.DATABASE.prepare(
       "INSERT OR IGNORE INTO rule_devices (rule_id, device_id, user_id) VALUES (?, ?, ?)"
     ).bind(rule_id, deviceId, env.USER_ID).run()
   }
   return Response.json({
     rule_id, user_id: env.USER_ID, name: body.name ?? null, strategy: body.strategy,
-    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled, device_ids: deviceIds,
+    threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled,
+    ...(color ? { color } : {}), device_ids: resolvedIds,
   }, { status: 201 })
 }
 
@@ -1332,11 +1643,11 @@ async function handleSquidRuleCreate(request, env, _ctx, _params) {
  */
 async function handleSquidRuleGet(_request, env, _ctx, params) {
   const rule = await env.DATABASE.prepare(
-    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled FROM rules WHERE user_id = ? AND rule_id = ?"
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, enabled, color_config FROM rules WHERE user_id = ? AND rule_id = ?"
   ).bind(env.USER_ID, params.ruleId).first()
   if (!rule) return new Response("Not Found", { status: 404 })
   const devicesByRule = await ruleDeviceMap(env)
-  return Response.json({ ...rule, devices: devicesByRule.get(params.ruleId) ?? [] })
+  return Response.json({ ...ruleForResponse(rule), devices: devicesByRule.get(params.ruleId) ?? [] })
 }
 
 /**
@@ -1358,13 +1669,15 @@ async function handleSquidRuleUpdate(request, env, _ctx, params) {
   if (!exists) return new Response("Not Found", { status: 404 })
   const efficiency = body.efficiency ?? 1
   const enabled = body.enabled === false ? 0 : 1
+  const color = body.strategy === "price_color" ? colorConfigFromBody(body) : null
   await env.DATABASE.prepare(
-    `UPDATE rules SET name = ?, strategy = ?, threshold_p = ?, hours = ?, efficiency = ?, enabled = ?
+    `UPDATE rules SET name = ?, strategy = ?, threshold_p = ?, hours = ?, efficiency = ?, enabled = ?, color_config = ?
      WHERE user_id = ? AND rule_id = ?`
-  ).bind(body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled, env.USER_ID, params.ruleId).run()
+  ).bind(body.name ?? null, body.strategy, body.threshold_p ?? null, body.hours ?? null, efficiency, enabled, color ? JSON.stringify(color) : null, env.USER_ID, params.ruleId).run()
   return Response.json({
     rule_id: params.ruleId, user_id: env.USER_ID, name: body.name ?? null, strategy: body.strategy,
     threshold_p: body.threshold_p ?? null, hours: body.hours ?? null, efficiency, enabled,
+    ...(color ? { color } : {}),
   })
 }
 
@@ -1398,19 +1711,17 @@ async function handleSquidRuleDelete(_request, env, _ctx, params) {
  * @returns {Promise<Response>}
  */
 async function handleSquidRuleTagDevice(_request, env, _ctx, params) {
+  /** @type {{ strategy: string } | null} */
   const rule = await env.DATABASE.prepare(
-    "SELECT 1 FROM rules WHERE user_id = ? AND rule_id = ?"
+    "SELECT strategy FROM rules WHERE user_id = ? AND rule_id = ?"
   ).bind(env.USER_ID, params.ruleId).first()
   if (!rule) return new Response("Rule not found", { status: 404 })
   const { target, ambiguous } = await resolveTarget(env, params.id)
   if (ambiguous) return new Response("Ambiguous device name; use the deviceId", { status: 409 })
   if (!target) return new Response("Unknown device; not found on your TP-Link account", { status: 404 })
   const { device: dev, childId } = target
-  // A power strip has no single relay; tag the individual outlets instead.
-  if (!childId && dev.children?.length) {
-    const ids = dev.children.map(c => c.id).join(", ")
-    return new Response(`This is a power strip; tag a specific outlet instead (${ids})`, { status: 409 })
-  }
+  const targetErr = ruleTargetError(rule.strategy, target)
+  if (targetErr) return new Response(targetErr, { status: 409 })
   const taggedId = childId ?? dev.deviceId
   await env.DATABASE.prepare(
     "INSERT OR IGNORE INTO rule_devices (rule_id, device_id, user_id) VALUES (?, ?, ?)"
@@ -1464,42 +1775,59 @@ async function computeSquidForecast(request, env) {
   const days = param ? [param] : [today, new Date(Date.now() + 86400000).toISOString().slice(0, 10)]
   /** @type {{ results: any[] }} */
   const { results: rules } = await env.DATABASE.prepare(
-    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency FROM rules WHERE user_id = ? AND enabled = 1"
+    "SELECT rule_id, name, strategy, threshold_p, hours, efficiency, color_config FROM rules WHERE user_id = ? AND enabled = 1"
   ).bind(env.USER_ID).all()
   const devicesByRule = await ruleDeviceMap(env)
   const results = []
   for (const rule of rules) {
-    const slots = []
+    // Day rates for the window, fetched once and shared by both rule kinds.
+    /** @type {{ time_start: string, time_end: string, price: string }[]} */
+    const windowRates = []
     for (const day of days) {
       /** @type {{ results: { time_start: string, time_end: string, price: string }[] }} */
       const { results: dayRates } = await env.DATABASE.prepare(
         "SELECT time_start, time_end, price FROM rates WHERE user_id = ? AND time_start >= ? AND time_start < ? ORDER BY time_start ASC"
       ).bind(env.USER_ID, `${day}T00:00:00Z`, `${day}T24:00:00Z`).all()
-      let qualifies
-      if (rule.strategy === "cheapest_hours") {
-        const set = await cheapestStarts(env, day, Math.max(1, Math.round(rule.hours * 2)))
-        qualifies = (/** @type {{ time_start: string }} */ r) => set.has(r.time_start)
-      } else if (rule.strategy === "cheaper_than_gas") {
-        // Gas is typically a flat daily rate; take one price for the day (noon).
-        const gasPrice = await gasPriceAt(env, `${day}T12:00:00Z`)
-        const ceiling = gasPrice == null ? -Infinity : gasPrice * (rule.efficiency ?? 1)
-        qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= ceiling
-      } else {
-        qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= rule.threshold_p
-      }
-      for (const r of dayRates) if (qualifies(r)) slots.push(r)
+      windowRates.push(...dayRates)
     }
+    const base = { rule_id: rule.rule_id, name: rule.name, strategy: rule.strategy, devices: devicesByRule.get(rule.rule_id) ?? [] }
+
+    // price_color: report how many half-hours fall in each colour band.
+    if (rule.strategy === "price_color") {
+      /** @type {any} */
+      let config = null
+      try { config = JSON.parse(rule.color_config) } catch { /* malformed */ }
+      const bands = config?.bands ?? []
+      const counts = bands.map(() => 0)
+      for (const r of windowRates) counts[bandIndexFor(parseFloat(r.price), bands)]++
+      results.push({
+        ...base, color: config,
+        bands: bands.map((/** @type {any} */ b, /** @type {number} */ i) => ({ hue: b.hue, up_to_p: b.up_to_p, slots: counts[i], hours: counts[i] / 2 })),
+      })
+      continue
+    }
+
+    // on/off strategies: which half-hours the rule would be ON.
+    let qualifies
+    if (rule.strategy === "cheapest_hours") {
+      // cheapest_hours ranks within a single UTC day; evaluate per day.
+      /** @type {Set<string>} */
+      const cheap = new Set()
+      for (const day of days) for (const s of await cheapestStarts(env, day, Math.max(1, Math.round(rule.hours * 2)))) cheap.add(s)
+      qualifies = (/** @type {{ time_start: string }} */ r) => cheap.has(r.time_start)
+    } else if (rule.strategy === "cheaper_than_gas") {
+      // Gas is typically a flat daily rate; take one price for the day (noon).
+      const gasPrice = await gasPriceAt(env, `${days[0]}T12:00:00Z`)
+      const ceiling = gasPrice == null ? -Infinity : gasPrice * (rule.efficiency ?? 1)
+      qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= ceiling
+    } else {
+      qualifies = (/** @type {{ price: string }} */ r) => parseFloat(r.price) <= rule.threshold_p
+    }
+    const slots = windowRates.filter(qualifies)
     results.push({
-      rule_id: rule.rule_id,
-      name: rule.name,
-      strategy: rule.strategy,
-      threshold_p: rule.threshold_p,
-      hours: rule.hours,
-      efficiency: rule.efficiency,
-      devices: devicesByRule.get(rule.rule_id) ?? [],
-      on_slots: slots.length,
-      on_hours: slots.length / 2,
-      slots,
+      ...base,
+      threshold_p: rule.threshold_p, hours: rule.hours, efficiency: rule.efficiency,
+      on_slots: slots.length, on_hours: slots.length / 2, slots,
     })
   }
   return Response.json({ days, results })
@@ -1559,6 +1887,7 @@ const ROUTES = [
   ["GET",    "/api/kasa/devices",               "devices:read",   handleKasaDevices],
   ["GET",    "/api/kasa/devices/:id",           "devices:read",   handleKasaDevice],
   ["POST",   "/api/kasa/devices/:id/state",     "devices:control",handleKasaDeviceState],
+  ["POST",   "/api/kasa/devices/:id/light",     "devices:control",handleKasaDeviceLight],
   ["GET",    "/api/kasa/devices/:id/usage",     "meters:read",    handleKasaDeviceUsage],
   ["GET",    "/api/kasa/devices/:id/energy",    "meters:read",    handleKasaDeviceEnergy],
   ["GET",    "/api/kasa/devices/:id/runtime",   "meters:read",    handleKasaDeviceRuntime],
