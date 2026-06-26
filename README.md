@@ -228,7 +228,7 @@ A `:id` may be a `device_id`, an **outlet id** (see [Power strips](#power-strips
 |--------|------|-------------|
 | `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (**live**), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). A power strip is listed as a container (`on: null`, `outlets: N`) followed by one row per outlet (each with `parent_id`, `parent_alias`, and its own `on`). |
 | `GET` | `/api/kasa/devices/:id` | Returns the **live** state of a single device or outlet. A strip parent returns the container with an `outlets` array; an outlet id/name returns just that outlet. |
-| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device or outlet on or off. Body: `{"on": true}`. Works for plugs, switches, strip outlets **and bulbs** (bulbs switch via the lighting service). Logs a `manual` entry. A strip *parent* is rejected (409) — target a specific outlet. |
+| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device or outlet on or off. Body: `{"on": true}`. Works for plugs, switches, strip outlets **and bulbs** (bulbs switch via the lighting service). Logs a `manual` entry. A strip *parent* is rejected (409) unless the strip has a master relay — otherwise target a specific outlet. |
 | `POST` | `/api/kasa/devices/:id/light` | Sets a **bulb's** colour / brightness / on-off. Body: any of `on` (bool), `hue` (0–360), `saturation` (0–100), `brightness` (0–100), `color_temp` (K; `0`/omitted = colour mode). Bulbs only (else 409). |
 | `GET` | `/api/kasa/devices/:id/usage` | Reads raw energy data from a device's (or outlet's) emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
 | `GET` | `/api/kasa/devices/:id/energy` | Live **energy use** (Kasa app's Energy Use view). Returns `realtime` (`power_w`, `voltage_v`, `current_a`), `today` (`total_wh`), `last_7_days` and `last_30_days` (each `total_wh` + `daily_avg_wh`). From the emeter module. On a strip, address a specific outlet (per-outlet emeter, e.g. HS300); bulbs have no emeter (409). |
@@ -244,7 +244,7 @@ A `:id` may be a `device_id`, an **outlet id** (see [Power strips](#power-strips
 | `GET` | `/api/squid/rules/:ruleId` | Returns one rule with its tagged devices. |
 | `PUT` | `/api/squid/rules/:ruleId` | Updates a rule's definition (not its device tags). |
 | `DELETE` | `/api/squid/rules/:ruleId` | Deletes a rule and all its device tags. |
-| `POST` | `/api/squid/rules/:ruleId/devices/:id` | **Tags** a device/outlet onto the rule (`:id` = deviceId, outlet id or name). Rejected (409) if unsuitable for the rule's strategy — a strip *parent* (any strategy), or a non-colour device on a `price_color` rule. |
+| `POST` | `/api/squid/rules/:ruleId/devices/:id` | **Tags** a device/outlet onto the rule (`:id` = deviceId, outlet id or name). Rejected (409) if unsuitable for the rule's strategy — a strip *parent* without a master relay (any strategy), or a non-colour device on a `price_color` rule. |
 | `DELETE` | `/api/squid/rules/:ruleId/devices/:id` | **Untags** a device from the rule, leaving the rule intact. |
 | `GET` | `/api/squid/forecast` | Read-only preview of which half-hour slots each enabled rule would fire, plus the `devices` it is tagged to, computed from cached rates (no Kasa calls, no switching). Defaults to today + tomorrow (UTC); pass `?date=YYYY-MM-DD` for a single day. On/off rules include `on_slots`, `on_hours` and the qualifying `slots`; `price_color` rules instead include `bands` (`hue`, `up_to_p`, `slots`, `hours` per colour band). |
 | `POST` | `/api/squid/evaluate` | Evaluates all enabled rules against the current rate and switches devices as needed. Returns the actions taken. |
@@ -420,14 +420,19 @@ its own switchable load**.
   #   {"device_id":"8006…01","parent_id":"8006…","parent_alias":"Office Strip","alias":"Desk Lamp","status":1,"on":false}, …
   # ]}
   ```
-- **Switching / rules.** Address the outlet, not the strip. Switching or tagging
-  the strip *parent* is rejected (409) — there's no single relay to drive:
+- **Switching / rules.** Address the outlet, not the strip:
   ```bash
   curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" -d '{"on":true}' \
     https://<worker>/api/kasa/devices/8006…01/state          # one outlet
   curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
     https://<worker>/api/squid/rules/<ruleId>/devices/8006…01  # tag that outlet
   ```
+  Switching or tagging the strip *parent* is rejected (409) on the usual Kasa
+  strips (HS300/KP303/EP40…): they have no top-level relay, and switching every
+  outlet individually would lose each outlet's own state. The **only** exception is
+  a strip that exposes a real **master relay** (`get_sysinfo.relay_state`) — there
+  the parent switches the whole strip losslessly and may be tagged like any device.
+  Squid caches whether a strip has a master (`master` flag) so it knows which is which.
 - **Energy / runtime.** Read per outlet too (the HS300 has a per-outlet emeter);
   `energy`/`runtime`/`usage` on a strip parent return a 409 asking for an outlet.
 

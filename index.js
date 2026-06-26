@@ -13,6 +13,9 @@
  *   overlaid without a live call. See {@link refreshDeviceSnapshot}.
  * @property {KasaCaps} [caps] - bulb capability flags, learned from `get_sysinfo`
  *   and cached (they don't change). Lets colour ops be guarded without a live read.
+ * @property {boolean} [master] - for a power strip: whether it exposes a top-level
+ *   master relay (`get_sysinfo.relay_state`) that switches the whole strip at once.
+ *   Most Kasa strips don't — those are controlled per-outlet only.
  */
 
 /**
@@ -25,10 +28,11 @@
 
 /**
  * Facts learned from a `get_sysinfo` that are worth caching in the snapshot: a
- * strip's outlets and a bulb's capability flags.
+ * strip's outlets, whether it has a master relay, and a bulb's capability flags.
  * @typedef {Object} DeviceFacts
  * @property {KasaOutlet[]} [children]
  * @property {KasaCaps} [caps]
+ * @property {boolean} [master] - strip has a top-level master relay (paired with children).
  */
 
 /**
@@ -344,7 +348,7 @@ async function refreshDeviceSnapshot(env) {
   const prevById = new Map((prev || []).map(d => [d.deviceId, d]))
   const merged = devices.map(d => {
     const p = prevById.get(d.deviceId)
-    return p ? { ...d, ...(p.children ? { children: p.children } : {}), ...(p.caps ? { caps: p.caps } : {}) } : d
+    return p ? { ...d, ...(p.children ? { children: p.children } : {}), ...(p.caps ? { caps: p.caps } : {}), ...(p.master != null ? { master: p.master } : {}) } : d
   })
   await persistDeviceSnapshot(env, merged)
   return merged
@@ -406,12 +410,16 @@ function capsFromSysinfo(sysinfo) {
 }
 
 /**
- * The cacheable facts from a `get_sysinfo`: a strip's outlets and a bulb's caps.
+ * The cacheable facts from a `get_sysinfo`: a strip's outlets, whether the strip
+ * has a master relay, and a bulb's caps.
  * @param {any} sysinfo - the `system.get_sysinfo` object.
  * @returns {DeviceFacts}
  */
 function factsFromSysinfo(sysinfo) {
-  return { children: childrenFromSysinfo(sysinfo), caps: capsFromSysinfo(sysinfo) }
+  const children = childrenFromSysinfo(sysinfo)
+  // A strip with a top-level relay_state can be switched as a whole (lossless);
+  // most strips lack it and are controlled per-outlet.
+  return { children, caps: capsFromSysinfo(sysinfo), master: children.length > 0 && sysinfo?.relay_state != null }
 }
 
 /**
@@ -430,7 +438,8 @@ async function persistDeviceFacts(env, factsByDevice) {
     const f = factsByDevice.get(d.deviceId)
     if (!f) return d
     let next = d
-    if (f.children && f.children.length) { next = { ...next, children: f.children }; changed = true }
+    // master is a property of a strip, so it's learned/stored together with children.
+    if (f.children && f.children.length) { next = { ...next, children: f.children, master: !!f.master }; changed = true }
     if (f.caps) { next = { ...next, caps: f.caps }; changed = true }
     return next
   })
@@ -1083,8 +1092,10 @@ async function handleKasaDevices(_request, env, _ctx, _params) {
     if (sysinfo) learned.set(d.deviceId, factsFromSysinfo(sysinfo))
     const children = sysinfo && sysinfo.children
     if (children && children.length) {
+      // A strip's parent `on` is its master relay state if it has one, else null.
+      const master = sysinfo.relay_state == null ? null : sysinfo.relay_state === 1
       return [
-        { device_id: d.deviceId, ...base, on: null, outlets: children.length },
+        { device_id: d.deviceId, ...base, on: master, outlets: children.length },
         ...children.map((/** @type {any} */ c) => ({ device_id: c.id, parent_id: d.deviceId, parent_alias: d.alias, alias: c.alias, model: d.deviceModel, status: d.status, on: c.state === 1 })),
       ]
     }
@@ -1123,10 +1134,12 @@ async function handleKasaDevice(_request, env, _ctx, params) {
   if (sysinfo) await persistDeviceFacts(env, new Map([[dev.deviceId, factsFromSysinfo(sysinfo)]]))
   const children = sysinfo && sysinfo.children
 
-  // Strip parent (no specific outlet): return the container and its outlets.
+  // Strip parent (no specific outlet): return the container and its outlets. `on`
+  // is the master relay state when the strip has one, else null.
   if (!childId && children && children.length) {
     return Response.json({
-      device_id: dev.deviceId, alias: dev.alias, model: dev.deviceModel, status: dev.status, on: null,
+      device_id: dev.deviceId, alias: dev.alias, model: dev.deviceModel, status: dev.status,
+      on: sysinfo.relay_state == null ? null : sysinfo.relay_state === 1,
       outlets: children.map((/** @type {any} */ c) => ({ device_id: c.id, alias: c.alias, on: c.state === 1 })),
     })
   }
@@ -1161,13 +1174,14 @@ async function handleKasaDeviceState(request, env, _ctx, params) {
   if (!target) return new Response("Not Found", { status: 404 })
   const { device: dev, childId } = target
   if (dev.status !== 1) return new Response("Device offline", { status: 409 })
-  // Detect a power strip so an ambiguous whole-strip switch is refused rather
-  // than sent (the strip has no single relay) — and learn its outlets.
+  // A strip with no master relay can't be switched as a whole without losing each
+  // outlet's state, so refuse it; a strip that has a master relay (relay_state at
+  // the top level) switches losslessly via the relay below. Learn outlets/master.
   const sysinfo = await readSysinfo(env, dev)
   if (sysinfo) await persistDeviceFacts(env, new Map([[dev.deviceId, factsFromSysinfo(sysinfo)]]))
-  if (!childId && sysinfo?.children?.length) {
+  if (!childId && sysinfo?.children?.length && sysinfo.relay_state == null) {
     const ids = sysinfo.children.map((/** @type {any} */ c) => c.id).join(", ")
-    return new Response(`This is a power strip; switch a specific outlet instead (${ids})`, { status: 409 })
+    return new Response(`This power strip has no master switch; switch a specific outlet instead (${ids})`, { status: 409 })
   }
   await kasaSetState(env, dev, body.on, childId)
   const id = childId ?? dev.deviceId
@@ -1434,9 +1448,10 @@ function validateRuleBody(body) {
  * Whether a device/outlet is a valid target for a rule's strategy. Returns an
  * error message to reject the tag with, or null if allowed.
  *
- * - Every strategy: a strip *parent* is rejected (no single relay) — tag outlets.
+ * - Every strategy: a strip *parent* is rejected unless the strip has a master
+ *   relay (`master`); most strips don't, so tag their outlets instead.
  * - The on/off strategies (threshold / cheapest_hours / cheaper_than_gas) drive a
- *   relay or a bulb's on/off, so they're valid on any non-strip-parent load.
+ *   relay or a bulb's on/off, so they're valid on any allowed load.
  * - `price_color` drives a bulb's hue, so it needs a colour-capable bulb: a
  *   non-bulb (plug/switch/outlet) is rejected outright, and a bulb with cached
  *   `caps.color === false` is rejected. Unknown caps are allowed (they resolve on
@@ -1447,7 +1462,8 @@ function validateRuleBody(body) {
  */
 function ruleTargetError(strategy, target) {
   const { device: dev, childId } = target
-  if (!childId && dev.children?.length) {
+  // A strip parent is only a valid whole-device target when it has a master relay.
+  if (!childId && dev.children?.length && !dev.master) {
     return `This is a power strip; tag a specific outlet instead (${dev.children.map(c => c.id).join(", ")})`
   }
   if (strategy === "price_color") {
