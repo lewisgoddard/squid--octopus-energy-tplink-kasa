@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS [tplink_tokens] (
 -- to the metadata-only endpoints so they don't call the cloud per request.
 CREATE TABLE IF NOT EXISTS [device_cache] (
     user_id    text PRIMARY KEY,
-    json       text,            -- the getDeviceList array
+    json       text,            -- the getDeviceList array; power strips also carry a
+                                -- learned `children` array of outlets (id/alias/state)
     updated_at text
 );
 ```
@@ -220,15 +221,17 @@ All `/api/*` endpoints require `Authorization: Bearer <SQUID_API_KEY>`.
 
 `GET /api/kasa/devices` and `GET /api/kasa/devices/:id` go to the TP-Link cloud **live** for current relay (on/off) state. Everywhere else that needs device ids/names — resolving a `:id`, overlaying display names on rules/log — reads a **snapshot** of the device list (`device_cache`) instead of calling the cloud, sparing the API and the account-lockout risk. The snapshot is refreshed by the half-hourly evaluate cron **and by every live `kasa/devices`/`kasa/devices/:id` read** (they persist the list they fetch), so it's typically very fresh. A renamed/added/removed device shows up in the metadata endpoints after the next snapshot refresh; the two live endpoints reflect it immediately.
 
+A `:id` may be a `device_id`, an **outlet id** (see [Power strips](#power-strips-per-outlet)), or a (unique) device/outlet **name**.
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (**live**), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). |
-| `GET` | `/api/kasa/devices/:id` | Returns the **live** state of a single device. `:id` is a `device_id` or alias. |
-| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device on or off. Body: `{"on": true}`. Logs a `manual` entry. |
-| `GET` | `/api/kasa/devices/:id/usage` | Reads raw energy data from a device's emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
-| `GET` | `/api/kasa/devices/:id/energy` | Live **energy use** (Kasa app's Energy Use view). Returns `realtime` (`power_w`, `voltage_v`, `current_a`), `today` (`total_wh`), `last_7_days` and `last_30_days` (each `total_wh` + `daily_avg_wh`). From the emeter module. |
-| `GET` | `/api/kasa/devices/:id/runtime` | Live **runtime** (Kasa app's Runtime view). Returns `realtime` (`current_runtime_s` = current on-session), `today` (`total_min`), `last_7_days` and `last_30_days` (each `total_min` + `daily_avg_min`). From `get_sysinfo.on_time` + the `schedule` module's per-day minutes. |
-| `GET` | `/api/kasa/devices/:id/rules` | Reads the on-device firmware rules for a device (`schedule`, `count_down`, `anti_theft`). Note: this only surfaces device-level rules set in the Kasa app's "Device" section — cloud Smart Actions (geofencing, device triggers) are **not** retrievable via this API. |
+| `GET` | `/api/kasa/devices` | Lists real devices from your TP-Link Kasa cloud account (**live**), including each device's `status` (online) and `on` (relay state: `true`/`false`, or `null` when offline or unreadable). A power strip is listed as a container (`on: null`, `outlets: N`) followed by one row per outlet (each with `parent_id`, `parent_alias`, and its own `on`). |
+| `GET` | `/api/kasa/devices/:id` | Returns the **live** state of a single device or outlet. A strip parent returns the container with an `outlets` array; an outlet id/name returns just that outlet. |
+| `POST` | `/api/kasa/devices/:id/state` | Manually switch a device or outlet on or off. Body: `{"on": true}`. Logs a `manual` entry. A strip *parent* is rejected (409) — target a specific outlet. |
+| `GET` | `/api/kasa/devices/:id/usage` | Reads raw energy data from a device's (or outlet's) emeter. Query: `kind` (`realtime`, `day` or `month`; default `realtime`), `year`, `month` (default current UTC). |
+| `GET` | `/api/kasa/devices/:id/energy` | Live **energy use** (Kasa app's Energy Use view). Returns `realtime` (`power_w`, `voltage_v`, `current_a`), `today` (`total_wh`), `last_7_days` and `last_30_days` (each `total_wh` + `daily_avg_wh`). From the emeter module. On a strip, address a specific outlet (per-outlet emeter, e.g. HS300). |
+| `GET` | `/api/kasa/devices/:id/runtime` | Live **runtime** (Kasa app's Runtime view). Returns `realtime` (`current_runtime_s` = current on-session), `today` (`total_min`), `last_7_days` and `last_30_days` (each `total_min` + `daily_avg_min`). From `get_sysinfo.on_time` + the `schedule` module's per-day minutes. On a strip, address a specific outlet. |
+| `GET` | `/api/kasa/devices/:id/rules` | Reads the on-device firmware rules for a device or outlet (`schedule`, `count_down`, `anti_theft`). Note: this only surfaces device-level rules set in the Kasa app's "Device" section — cloud Smart Actions (geofencing, device triggers) are **not** retrievable via this API. |
 
 #### `squid/` — rate-based automation
 
@@ -389,6 +392,41 @@ curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
   https://<worker>/api/kasa/devices/80.../state
 ```
 
+#### Power strips (per-outlet)
+
+A multi-outlet power strip (HS300, KP303, EP40, …) is a single TP-Link device
+whose outlets are **children** of one `deviceId`. The strip itself has no single
+relay — each outlet switches independently — so Squid treats **each outlet as
+its own switchable load**.
+
+- **Outlet id.** An outlet's id is the strip's `deviceId` followed by a 2-digit
+  index, e.g. `<deviceId>00`, `<deviceId>01`. It is shown in the device list and
+  is used everywhere a `device_id` is accepted (state, rules, energy, runtime) —
+  so per-outlet support needs no special syntax. A unique outlet **name** also
+  works; duplicate names (strips often ship outlets named "Plug 1"…) are reported
+  as ambiguous, so use the id.
+- **Listing.** `GET /api/kasa/devices` shows the strip as a container row
+  (`on: null`, `outlets: N`) followed by one row per outlet (each with
+  `parent_id`, `parent_alias` and its own `on`):
+  ```bash
+  curl -H "Authorization: Bearer $SQUID_API_KEY" https://<worker>/api/kasa/devices
+  # {"results":[
+  #   {"device_id":"8006…","alias":"Office Strip","model":"HS300(UK)","status":1,"on":null,"outlets":6},
+  #   {"device_id":"8006…00","parent_id":"8006…","parent_alias":"Office Strip","alias":"Monitor","status":1,"on":true},
+  #   {"device_id":"8006…01","parent_id":"8006…","parent_alias":"Office Strip","alias":"Desk Lamp","status":1,"on":false}, …
+  # ]}
+  ```
+- **Switching / rules.** Address the outlet, not the strip. Switching or tagging
+  the strip *parent* is rejected (409) — there's no single relay to drive:
+  ```bash
+  curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" -d '{"on":true}' \
+    https://<worker>/api/kasa/devices/8006…01/state          # one outlet
+  curl -X POST -H "Authorization: Bearer $SQUID_API_KEY" \
+    https://<worker>/api/squid/rules/<ruleId>/devices/8006…01  # tag that outlet
+  ```
+- **Energy / runtime.** Read per outlet too (the HS300 has a per-outlet emeter);
+  `energy`/`runtime`/`usage` on a strip parent return a 409 asking for an outlet.
+
 #### On-device firmware rules
 
 `GET /api/kasa/devices/:id/rules` reads the schedule, countdown, and
@@ -400,7 +438,8 @@ retrievable via this API.
 #### Energy monitoring
 
 For devices with energy monitoring (an emeter), `/api/kasa/devices/:id/usage`
-reads consumption directly from the plug. `:id` accepts a `device_id` or an alias:
+reads consumption directly from the plug. `:id` accepts a `device_id`, an outlet
+id, or a (unique) name:
 
 ```bash
 # Live readings (voltage / current / power / total)
