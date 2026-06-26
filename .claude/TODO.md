@@ -41,8 +41,8 @@
         protocol (set_device_info{target_temp} via securePassthrough), so kasaSetTargetTemp
         throws "needs SMART transport" — the actual write awaits the Tapo cloud layer.
   - [ ] Tapo/SMART cloud transport — unblocks TRV writes AND Tapo plugs/bulbs (cross-cutting
-        #4). Plan: plans/TAPO_SMART_TRANSPORT.md. Phase 0 research DONE: protocol is simple
-        (separate Tapo V2 login + HMAC-SHA1 request signing + plaintext /api/v2/common/
-        passthrough; NO device RSA/KLAP/AES). BLOCKER: V2 hosts (n-*.tplinkcloud.com) use
-        TP-Link's PRIVATE CA — Workers fetch trusts only public CAs. Next: the TLS spike
-        (node:tls custom-CA) decides pure-Worker feasibility vs a relay.
+        #4). Plan: plans/TAPO_SMART_TRANSPORT.md. Phase 0+1 DONE. Protocol is simple (Tapo V2
+        login + HMAC-SHA1 signing + plaintext /api/v2/common/passthrough; NO device crypto).
+        CONFIRMED via deployed spike: a pure Worker CANNOT reach the Tapo V2 cloud — fetch→526
+        (private CA), node:tls won't socket to a web service. ⇒ needs a RELAY (Container/DO
+        sidecar, or external box via Tunnel) running the Tapo calls. Decide relay shape next.

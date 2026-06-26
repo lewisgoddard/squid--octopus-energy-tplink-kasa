@@ -9,14 +9,15 @@ setpoint, inverted `cheaper_than_gas`, the evaluate setpoint pass, `hubOf`) is a
 built and **gated** on this transport (`kasaSetTargetTemp` throws). See
 [DEVICE_SUPPORT.md](DEVICE_SUPPORT.md) Tier 3.
 
-> **⛔ Headline result: a hard TLS blocker, not the crypto we feared.** The cloud control
-> protocol turned out *simpler* than expected (a second login + request signing + a
-> plaintext passthrough — **no device-level RSA/KLAP/AES**). But Tapo cloud control only
-> runs on TP-Link's **V2 cloud hosts (`n-*.tplinkcloud.com`), which present certs from a
-> private TP-Link CA** that isn't in any public trust store. Cloudflare Workers `fetch()`
-> trusts only public CAs and can't add one — so a pure Worker likely **can't reach the
-> Tapo cloud at all**. This is the "cert problem," resurfaced on the cloud gateway.
-> Feasibility now hinges on one test (the TLS spike, below), not on protocol work.
+> **⛔ Headline result (CONFIRMED on production workerd): a Worker can't reach the Tapo
+> cloud.** The protocol is *simpler* than feared (second login + HMAC-SHA1 signing + a
+> plaintext passthrough — **no device RSA/KLAP/AES**), but it only runs on TP-Link's **V2
+> hosts (`n-*.tplinkcloud.com`), which use a private TP-Link CA**. A deployed spike proved:
+> `fetch` → **526 Invalid SSL Certificate** (edge rejects the private CA), and
+> `node:tls`/`connect()` → **"consider using fetch instead"** (workerd won't open a raw
+> socket to a web service to work around it). So a **pure-Worker Tapo transport is not
+> feasible — a relay (or local control) is required.** This is the "cert problem", on the
+> cloud gateway. The rest of this plan stands *once* a reachability path exists.
 
 ## Why this, and what it unblocks
 
@@ -75,9 +76,35 @@ Probably, for the cloud path — unless one of these works:
 | Option | Idea | Verdict |
 |---|---|---|
 | **`fetch` as-is** | Hope the V2 host chains to a public root | Very unlikely (private CA is explicit) |
-| **`node:tls` + `connect()`** | Raw TLS socket with the TP-Link CA as `ca`, speak HTTP/1.1 manually | **The one to test.** Needs Workers' `node:tls` to honour a custom `ca` — unverified, and means hand-rolling HTTP |
+| **`node:tls` + `connect()`** | Raw TLS socket with the TP-Link CA as `ca`, speak HTTP/1.1 manually | Skip-verify **ruled out** (see spike); custom-`ca` **unconfirmed** (deploy-only) |
 | **External relay** | A tiny non-Worker service / Container / Tunnel origin that holds the CA and forwards | Works, but abandons "no extra infra" |
 | **Local agent** | Control Tapo locally via a home box (HA, etc.) Squid calls | Biggest change; see the Matter discussion |
+
+## Phase 1 — TLS spike result
+
+Live probes settled the `fetch` question; a Worker spike (`spike/tapo-tls-spike/`) tested the
+`node:tls` escape hatch in `workerd`:
+
+- **`fetch` → blocked (certain).** `openssl`/`curl` reject `n-wap.i.tplinkcloud.com` against
+  the public store (`issuer = TP-Link Cloud Server CA`, `verify code 20`); `curl --cacert
+  <chain>` passes (HTTP 405) — i.e. the CA *works if trusted*. Workers `fetch` has no way to
+  add it.
+- **`connect()` → blocked (certain).** `SocketOptions` is only `secureTransport`/`allowHalfOpen`
+  — no CA / no `rejectUnauthorized`.
+- **`node:tls` skip-verify → ruled out.** `tls.connect({ rejectUnauthorized: false })` throws
+  **"The options.rejectUnauthorized option is not implemented"** in workerd.
+- **`node:tls` custom `ca` → ruled out (deployed test).** The spike was **deployed to the real
+  edge** and hit there. `fetch` returned **526 (Invalid SSL Certificate)** — Cloudflare rejects
+  the private-CA origin. Both `node:tls` attempts (default *and* custom `ca`) failed with
+  **"proxy request failed … It looks like you might be trying to connect to a HTTP-based
+  service — consider using fetch instead"** — i.e. **workerd refuses raw-socket/`node:tls`
+  connections to HTTP(S) web services**, full stop. So you can't hand-roll HTTPS to bypass the
+  trust store; the custom-`ca` idea is moot because you can't open the socket at all.
+
+**Bottom line: every pure-Worker path is closed, confirmed on production `workerd`.** A
+Cloudflare Worker **cannot reach the Tapo V2 cloud** — `fetch` won't trust the private CA, and
+`node:tls`/`connect()` won't open a socket to a web service to work around it. **A relay (or
+local control) is required.**
 
 ## Revised architecture (if the TLS spike passes)
 
@@ -95,15 +122,16 @@ Much smaller than the original crypto-heavy plan:
 
 ## Phases
 
-0. **✅ Research** — done (above).
-1. **🔬 TLS spike (gates everything):** from a Worker, `fetch` `n-wap.i.tplinkcloud.com`
-   (expect TLS failure), then try `node:tls`/`connect()` with the TP-Link CA chain. If
-   neither reaches the host, the pure-Worker approach is dead → decide relay vs. local.
-2. **Login + device list** — `tapoToken`, signed V2 `getDeviceListByPage`.
-3. **One Tapo plug end-to-end** — read + on/off via signed `passthrough`. Validates auth +
+0. **✅ Research** — done.
+1. **✅ TLS spike** — done & **deployed** to the real edge. Result: pure-Worker is impossible
+   (526 on `fetch`; `node:tls` won't socket to a web service). → a **relay** is required.
+2. **⛳ Decide + stand up a relay** (now the gating step) — Container/DO sidecar, or external
+   box via Tunnel. Everything below runs *on the relay*.
+3. **Login + device list** — `tapoToken`, signed V2 `getDeviceListByPage`.
+4. **One Tapo plug end-to-end** — read + on/off via signed `passthrough`. Validates auth +
    signing + transport before hubs.
-4. **Hub children** — `control_child` for KE100; un-gate `kasaSetTargetTemp`.
-5. **Integrate** — `proto` routing; Tapo plugs/bulbs join the existing on/off + colour rules.
+5. **Hub children** — `control_child` for KE100; un-gate `kasaSetTargetTemp`.
+6. **Integrate** — `proto` routing; Tapo plugs/bulbs join the existing on/off + colour rules.
 
 ## Risks & constraints
 
@@ -118,11 +146,23 @@ Much smaller than the original crypto-heavy plan:
 
 ## Recommendation
 
-**Do the Phase-1 TLS spike first — it's a ~20-line test and it decides feasibility.** The
-protocol work is now small and well-understood; the only thing that can sink a pure-Worker
-implementation is the private-CA TLS trust. If `node:tls` can't supply a custom CA, the
-realistic answer is a **small relay** (or local control), which is a product decision worth
-taking before investing further.
+The deployed spike settled it: **a pure-Worker Tapo transport is not possible** (the Worker
+can't trust the private CA via `fetch`, and can't open a raw socket to work around it). The
+protocol itself is small and understood — so the work is now entirely about **reachability**:
+
+1. **Pick a relay** (the realistic options, smallest first):
+   - **Cloudflare Container / Durable-Object sidecar** — runs Node with a normal TLS stack
+     that can trust the bundled TP-Link CA; the Worker calls it over a binding. Keeps it all
+     on Cloudflare.
+   - **Tiny always-on box** (VPS / home server / the user's existing infra) running the Tapo
+     calls, exposed to the Worker via a Tunnel or signed HTTP.
+   - **Local control** (Matter / Home Assistant) — covered in the Matter discussion.
+2. **Then** the transport is small: `tapoToken` (V2 login) + HMAC-SHA1 signing + V2
+   `passthrough` (plaintext `requestData`) run *on the relay*; the Worker calls the relay and
+   un-gates `kasaSetTargetTemp`. No device-level crypto.
+
+Until a relay exists, Tier-3 TRV writes stay gated (the rule model is already done and inert).
+This is a **product/infra decision** — confirm the relay shape before building.
 
 ## Sources
 
