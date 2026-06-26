@@ -40,6 +40,9 @@
         setpoint pass computing the target temp. BLOCKED on transport: KE100 is SMART/Tapo
         protocol (set_device_info{target_temp} via securePassthrough), so kasaSetTargetTemp
         throws "needs SMART transport" — the actual write awaits the Tapo cloud layer.
-  - [ ] Tapo/SMART cloud transport (KLAP, appType TP-Link_Tapo_Android + control_child) —
-        unblocks TRV writes AND Tapo plugs/bulbs (cross-cutting #4). Plan:
-        plans/TAPO_SMART_TRANSPORT.md (do its Phase 0 verify before committing)
+  - [ ] Tapo/SMART cloud transport — unblocks TRV writes AND Tapo plugs/bulbs (cross-cutting
+        #4). Plan: plans/TAPO_SMART_TRANSPORT.md. Phase 0 research DONE: protocol is simple
+        (separate Tapo V2 login + HMAC-SHA1 request signing + plaintext /api/v2/common/
+        passthrough; NO device RSA/KLAP/AES). BLOCKER: V2 hosts (n-*.tplinkcloud.com) use
+        TP-Link's PRIVATE CA — Workers fetch trusts only public CAs. Next: the TLS spike
+        (node:tls custom-CA) decides pure-Worker feasibility vs a relay.
