@@ -49,4 +49,12 @@
         binding-only) — Worker keeps ALL per-user auth/HMAC-signing/tokens; container holds no
         creds. Profile-driven: same transport for Tapo AND Kasa v2 (host + app keys differ).
         Auth: refresh-token bootstrap (MFA once → store refresh token per user) so 2FA stays ON,
-        no passwords stored. Next: container spike to prove a Container reaches the V2 cloud.
+        no passwords stored.
+    - [~] Relay built in relay/ (forwarder.mjs + tplink-roots.pem [both private roots] + Dockerfile
+          + worker.mjs Container class + wrangler.toml). LOCALLY VALIDATED: forwards to all 3 V2
+          hosts (Tapo/Kasa-v2/NBU) with real responses; allowlist/error cases pass. Image builds
+          (amd64), Worker uploads, but `wrangler deploy` blocked at /containers/me → Unauthorized:
+          ACCOUNT needs Containers enabled (Workers Paid plan). Once enabled: cd relay && wrangler
+          deploy, then end-to-end test. Set a real RELAY_SECRET first.
+    - [ ] After relay deploys: build the Worker-side SMART transport (tapoToken + HMAC-SHA1 signing
+          + V2 passthrough via the relay) + refresh-token bootstrap; un-gate kasaSetTargetTemp.

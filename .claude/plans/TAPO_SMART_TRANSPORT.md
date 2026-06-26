@@ -179,6 +179,19 @@ The relay is a **stateless, credential-free, CA-trusting HTTPS forwarder** — n
 All TP-Link/per-user logic stays in the Worker; the Container only does the one thing the
 Worker can't: terminate TLS to a private-CA origin and forward.
 
+> **Build status (`relay/`): built & locally validated; CF deploy blocked on account
+> entitlement.** The forwarder (`forwarder.mjs`) + CA bundle (`tplink-roots.pem`, both
+> private roots — Tapo "Cloud Root CA" via piekstra, Kasa/NBU "tp-link-CA") were validated
+> locally against **all three V2 hosts**: `n-wap.i.tplinkcloud.com` (Tapo), `n-wap.tplinkcloud.com`
+> (Kasa-v2), `euw1-app-server.iot.i.tplinknbu.com` (NBU) all return **real responses** (the
+> Tapo passthrough even returns a genuine `{"error_code":-10000,…405…}` JSON) — TLS trust +
+> forward + host-allowlist + the 403/400 error cases all pass. The container image **builds**
+> (amd64) and the **Worker uploads**, but `wrangler deploy` fails at `GET /containers/me →
+> Unauthorized`: **Containers isn't enabled on the account** (needs a Workers **Paid** plan +
+> Containers onboarding). Once enabled, `cd relay && wrangler deploy` should just work — then
+> the deployed end-to-end test (Worker→Container→Tapo, expect the 405 JSON not a TLS error).
+> Set a real `RELAY_SECRET` (not the placeholder) before any non-throwaway deploy.
+
 **Responsibility split (multi-user safe):**
 
 | Concern | Where | Why |

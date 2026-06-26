@@ -1,0 +1,23 @@
+name = "tapo-relay"
+main = "worker.mjs"
+compatibility_date = "2026-06-08"
+
+# The CA-trusting forwarder runs in a container (a Worker's fetch can't trust the
+# TP-Link private CA). See Dockerfile + forwarder.mjs.
+[[containers]]
+class_name = "TapoRelay"
+image = "./Dockerfile"
+max_instances = 3
+
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "TapoRelay"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TapoRelay"]
+
+# Shared secret gating the relay (set a real one via `wrangler secret put RELAY_SECRET`
+# for anything beyond a throwaway test).
+[vars]
+RELAY_SECRET = "spike-only-change-me"
