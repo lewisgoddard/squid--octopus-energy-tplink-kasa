@@ -4,110 +4,135 @@ How Squid would talk to TP-Link's newer **SMART** protocol (Tapo-branded devices
 newer Kasa firmware) over the cloud — the prerequisite that unblocks **TRV setpoints**
 (KE100/KH100) and brings **Tapo plugs/bulbs/strips** into the same rate automation.
 
-Status: **not started.** The Tier-3 rule model (`invert` + setpoint, inverted
-`cheaper_than_gas`, the evaluate setpoint pass, `hubOf`) is already built and **gated**
-on this transport — `kasaSetTargetTemp` throws until it exists. See
+Status: **Phase 0 (research) done — see findings below.** The Tier-3 rule model (`invert` +
+setpoint, inverted `cheaper_than_gas`, the evaluate setpoint pass, `hubOf`) is already
+built and **gated** on this transport (`kasaSetTargetTemp` throws). See
 [DEVICE_SUPPORT.md](DEVICE_SUPPORT.md) Tier 3.
+
+> **⛔ Headline result: a hard TLS blocker, not the crypto we feared.** The cloud control
+> protocol turned out *simpler* than expected (a second login + request signing + a
+> plaintext passthrough — **no device-level RSA/KLAP/AES**). But Tapo cloud control only
+> runs on TP-Link's **V2 cloud hosts (`n-*.tplinkcloud.com`), which present certs from a
+> private TP-Link CA** that isn't in any public trust store. Cloudflare Workers `fetch()`
+> trusts only public CAs and can't add one — so a pure Worker likely **can't reach the
+> Tapo cloud at all**. This is the "cert problem," resurfaced on the cloud gateway.
+> Feasibility now hinges on one test (the TLS spike, below), not on protocol work.
 
 ## Why this, and what it unblocks
 
-- **KE100 TRV setpoints** — KE100 speaks SMART (`set_device_info {"target_temp"}`), not
-  Kasa IOT, so it can't ride our current `passthrough`. The setpoint logic is done; only
+- **KE100 TRV setpoints** — KE100 speaks SMART, not Kasa IOT. Setpoint logic is done; only
   the write is missing.
-- **Tapo plugs/bulbs/strips** (P100/P110/P300, L530, …) — same SMART protocol; today
-  they're invisible to Squid. Same rate rules would apply (P110 even has energy data).
-- **Newer Kasa "v2" firmware** that moved to KLAP auth.
+- **Tapo plugs/bulbs/strips** (P100/P110/P300, L530, …) — same SMART cloud; today invisible
+  to Squid. P110 even exposes energy data.
+- **Newer Kasa "v2" firmware** on the V2 cloud.
 
-## Guiding principle
+## Phase 0 findings (the open questions, answered)
 
-Stay **cloud-only** (no LAN footprint — Squid is a Worker). Add a **second transport**
-beside the existing Kasa IOT one, selected per device, reusing the rule/evaluate/snapshot
-machinery unchanged. Don't rewrite the Kasa path; devices that work today keep working.
+Grounded in piekstra/tplink-cloud-api (a **pure-cloud** lib supporting both Kasa and Tapo),
+TA2k/ioBroker.tapo, python-kasa, and Cloudflare docs. No hardware — treat as
+reference-verified, not live-verified.
 
-## Background: two protocols, two crypto layers
+**Q1 — Separate login? YES (same credentials).** Tapo uses the **V2 cloud**:
+`POST https://n-wap.i.tplinkcloud.com/api/v2/account/login` with `appType/appName =
+TP-Link_Tapo_Android`, `cloudUserName`/`cloudPassword`/`terminalUUID` → `result.token`
+(+ refresh token). Same TP-Link account as Kasa, but a **separate token + host** (and a
+distinct app AccessKey/SecretKey). Devices via `GET /api/v2/common/getDeviceListByPage`.
 
-| | Kasa IOT (today) | SMART (this plan) |
+**Q2 — Cloud relay path? `passthrough`, plaintext, but signed.**
+`POST {host}/api/v2/common/passthrough?token=…` with body `{deviceId, requestData}` where
+`requestData` is the **plaintext** inner command, e.g. `{"method":"set_device_info",
+"params":{"target_temp":21}}`, JSON-stringified. **No per-device encryption** — the cloud
+owns the device's secure session. Every V2 request is **HMAC-SHA1 signed**:
+- `Content-MD5: base64(md5(body))`
+- `X-Authorization: Timestamp=9999999999, Nonce=<uuid>, AccessKey=<app key>, Signature=<hex hmacSHA1(secret, "{md5}\n9999999999\n{nonce}\n{path}")>`
+- App keys are hardcoded from the Tapo APK (not user secrets).
+
+**Q3 — KLAP vs securePassthrough? Neither, for cloud.** KLAP / old-RSA-securePassthrough /
+TPAP-SPAKE2+ are **local** device handshakes (only when talking to the device on the LAN).
+Over the cloud the session is the cloud's job, so the KE100/KH100 is just `control_child` +
+`set_device_info` inside the signed V2 passthrough. **This removes the entire crypto
+subsystem from the plan.**
+
+**Q4 — Workers crypto? Not a constraint.** The only crypto the cloud path needs is **MD5 +
+HMAC-SHA1** for signing — both in `node:crypto` (full API in Workers with `nodejs_compat`;
+WebCrypto also does HMAC-SHA1). The earlier RSA-PKCS1v1.5 worry is moot (no RSA needed; and
+`node:crypto` has `publicEncrypt` anyway).
+
+**Q5 (new) — TLS / private CA? The blocker.** piekstra ships `tplink-ca-chain.pem` and
+builds a custom SSL context because *"the V2 API servers (`n-*.tplinkcloud.com`) use
+TP-Link's private CA, which is not in the system trust store"* (root `tp-link-CA` →
+`TP-LINK CA P1` → `*.tplinkcloud.com`). Workers `fetch()` validates against the **public**
+root store with **no API to add a CA or skip verification** (the mTLS binding presents a
+*client* cert; Workers VPC only added *Cloudflare's own* Origin CA). So
+`fetch('https://n-wap.i.tplinkcloud.com/…')` from a Worker should fail the TLS handshake.
+(Note: Squid's current Kasa path uses the **V1** host `wap.tplinkcloud.com`, which has a
+public cert — that's why it works today.)
+
+## Does this break the pure-Worker design?
+
+Probably, for the cloud path — unless one of these works:
+
+| Option | Idea | Verdict |
 |---|---|---|
-| Login appType | `Kasa_Android` @ `wap.tplinkcloud.com` | `TP-Link_Tapo_Android` (Tapo/NBU cloud — endpoint **TBC**) |
-| Cloud call | `passthrough { deviceId, requestData }`, **plaintext** JSON | encrypted session inside a cloud relay |
-| Command shape | `{"system":{"set_relay_state":…}}` | `{"method":"set_device_info","params":{…}}` |
-| Children | strip outlets via `context.child_ids` | hub children via `control_child` / `get_child_device_list` |
-| Session crypto | none | **securePassthrough** *or* **KLAP** (below) |
+| **`fetch` as-is** | Hope the V2 host chains to a public root | Very unlikely (private CA is explicit) |
+| **`node:tls` + `connect()`** | Raw TLS socket with the TP-Link CA as `ca`, speak HTTP/1.1 manually | **The one to test.** Needs Workers' `node:tls` to honour a custom `ca` — unverified, and means hand-rolling HTTP |
+| **External relay** | A tiny non-Worker service / Container / Tunnel origin that holds the CA and forwards | Works, but abandons "no extra infra" |
+| **Local agent** | Control Tapo locally via a home box (HA, etc.) Squid calls | Biggest change; see the Matter discussion |
 
-### The crypto — and the Workers angle (the crux)
+## Revised architecture (if the TLS spike passes)
 
-- **securePassthrough (older Tapo fw):** client RSA keypair → device returns an AES key
-  **RSA-encrypted with PKCS#1 v1.5**, then AES-CBC bodies. ⚠️ **WebCrypto can't do RSA
-  PKCS1v1.5 encryption** (only RSA-OAEP) — this path needs a JS RSA shim.
-- **KLAP (newer fw, preferred):** handshake derives the session key from **SHA-256 of
-  credential hashes + client/server seeds** (no RSA), then **AES-CBC + per-request
-  sequence/signature**. All primitives (SHA-256, HMAC, AES-CBC) are **native to Workers'
-  SubtleCrypto** → KLAP is the Worker-friendly route and avoids the RSA gap.
+Much smaller than the original crypto-heavy plan:
 
-This is *not* the "v2 cert problem" — that (self-signed device TLS certs / skip-verify) is
-a **local-control** issue. Cloud-only sidesteps it; the cost here is the session crypto.
+- `tapoToken(env)` — V2 login to the Tapo host, cache token+refresh (new `tapo_tokens` row).
+- `signV2(bodyJson, path)` — Content-MD5 + X-Authorization (md5 + HMAC-SHA1, `node:crypto`).
+- `smartCall(env, dev, method, params, childId?)` — signed `POST /api/v2/common/passthrough`
+  with `requestData = {method, params}` (wrap a hub child in `control_child`). Reachability
+  via whatever the TLS spike proves (`node:tls` socket or relay).
+- `kasaSetTargetTemp` (currently throws) → `smartCall("set_device_info", {target_temp})`.
+- **Transport selection:** tag each snapshot device `proto: "iot" | "smart"`; route reads/
+  writes accordingly. Rule engine, `resolveTarget`/`hubOf`, snapshot, endpoints stay
+  protocol-agnostic.
 
-## Architecture / fit
+## Phases
 
-Today's layer: `tplinkToken` → `tplinkCall` → `kasaPassthrough(dev, cmd, childId?)`.
-Mirror it:
-
-- `tapoToken(env)` — SMART login (separate appType/endpoint, cached like `tplink_tokens`,
-  new `tapo_tokens` row or a `proto` column).
-- `smartSession(env, dev)` — KLAP handshake → cached session keys (short-lived).
-- `smartCall(env, dev, method, params, childId?)` — encrypt `{method,params}` (wrapping in
-  `control_child` for a hub child), POST to the cloud relay, decrypt the response.
-- `kasaSetTargetTemp` (currently throws) → calls `smartCall("set_device_info",{target_temp})`.
-- **Transport selection:** tag each snapshot device with `proto: "iot" | "smart"` (from
-  which login/list it came from, or deviceType), and route reads/writes accordingly. The
-  rule engine, `resolveTarget`/`hubOf`, snapshot and endpoints stay protocol-agnostic.
-
-## Phased implementation (each phase independently verifiable where possible)
-
-0. **Spike + verify (no code commitment):** confirm against python-kasa `klaptransport.py`
-   / `aestransport.py` + TA2k/ioBroker.tapo (cloud flow): exact KLAP handshake bytes, the
-   Tapo cloud login endpoint, whether one login surfaces both Kasa+Tapo or two are needed,
-   and that Workers SubtleCrypto covers every primitive. **Gate the rest on this.**
-1. **Tapo cloud login + device list** — get a token, enumerate SMART devices.
-2. **KLAP session** — handshake + encrypt/decrypt helpers (unit-test vectors offline).
-3. **One Tapo plug end-to-end** — read state + on/off. Validates the whole stack on a
-   simple device before touching hubs.
-4. **Hub children** — `get_child_device_list` on KH100, `control_child` for KE100; wire
-   `kasaSetTargetTemp`; un-gate the setpoint pass.
-5. **Integrate** — `proto` routing in the snapshot + device endpoints; Tapo plugs/bulbs
-   join the existing on/off + colour rules.
+0. **✅ Research** — done (above).
+1. **🔬 TLS spike (gates everything):** from a Worker, `fetch` `n-wap.i.tplinkcloud.com`
+   (expect TLS failure), then try `node:tls`/`connect()` with the TP-Link CA chain. If
+   neither reaches the host, the pure-Worker approach is dead → decide relay vs. local.
+2. **Login + device list** — `tapoToken`, signed V2 `getDeviceListByPage`.
+3. **One Tapo plug end-to-end** — read + on/off via signed `passthrough`. Validates auth +
+   signing + transport before hubs.
+4. **Hub children** — `control_child` for KE100; un-gate `kasaSetTargetTemp`.
+5. **Integrate** — `proto` routing; Tapo plugs/bulbs join the existing on/off + colour rules.
 
 ## Risks & constraints
 
-- **No hardware** — validate against references + offline crypto test vectors; treat live
-  behaviour as unverified (same constraint as the rest of the device work).
-- **Workers limits** — CPU time for crypto (fine for AES/SHA), subrequest count per
-  request (handshake + call = multiple round-trips), no raw TCP needed (cloud is HTTPS).
-- **No RSA PKCS1v1.5 in WebCrypto** — pushes us to KLAP; only fall back to a JS RSA shim if
-  a target device is securePassthrough-only.
-- **Account lockout** — extra login/handshake traffic; reuse cached tokens/sessions, back
-  off on errors (as the Kasa path already does).
-- **KLAP variance** — v1 vs v2 hash ordering differs by firmware; may need both.
-
-## Open questions to resolve in Phase 0
-
-1. Does the existing Kasa login/`getDeviceList` already return Tapo/SMART devices (with a
-   different `deviceType`), or is a wholly separate Tapo login + endpoint required?
-2. What is the cloud relay path for an encrypted SMART command (host, method, how the
-   KLAP blob is carried)? — TA2k/ioBroker.tapo is the closest cloud reference.
-3. KLAP vs securePassthrough per target device (KE100/KH100 specifically)?
-4. Confirm SubtleCrypto covers the exact KLAP primitives (AES-CBC, SHA-256, HMAC).
+- **TLS private CA (Q5)** — the make-or-break; resolve in Phase 1 before any other build.
+- **No hardware** — validate against references + the live TLS/login spike only.
+- **Request signing brittleness** — exact sig string / hardcoded app keys can change with
+  app versions; copy from a current reference and expect to bump `appVer`.
+- **Account lockout / MFA** — V2 surfaces MFA + lockout error codes; reuse cached tokens,
+  back off, surface clearly.
+- **Regional hosts** — saw `n-wap.i…`, `n-euw1-wap-gw…`, `euw1-app-server.iot.i.tplinknbu.com`;
+  the login/account-status call likely returns the right regional URL to use.
 
 ## Recommendation
 
-KLAP-first, cloud-only, phased — and **do Phase 0 before committing**, because the cloud
-relay path (Q2) is the single biggest unknown and determines whether this is feasible
-within Squid's architecture at all. Skip securePassthrough/RSA unless a needed device
-demands it.
+**Do the Phase-1 TLS spike first — it's a ~20-line test and it decides feasibility.** The
+protocol work is now small and well-understood; the only thing that can sink a pure-Worker
+implementation is the private-CA TLS trust. If `node:tls` can't supply a custom CA, the
+realistic answer is a **small relay** (or local control), which is a product decision worth
+taking before investing further.
 
 ## Sources
 
-- python-kasa SMART transports — `kasa/transports/klaptransport.py`, `aestransport.py`
-- Tapo **cloud** control (closest to our model) — https://github.com/TA2k/ioBroker.tapo
-- KLAP reverse-engineering — python-kasa device fixtures / protocol docs
-- Tapo local protocol refs — https://github.com/python-kasa/python-kasa · pytapo
+- **piekstra/tplink-cloud-api** (pure cloud, Kasa+Tapo V2) — `client.py` (hosts/login),
+  `device_client.py` (`/api/v2/common/passthrough`, plaintext requestData), `signing.py`
+  (MD5 + HMAC-SHA1, app keys), `certs/__init__.py` (**private CA** note)
+- TA2k/ioBroker.tapo — `src/main.ts` (Tapo appType, `n-*-wap-gw` hosts, `getChildDevices`)
+- "Reverse engineering TP-Link Tapo's REST API" (HmacSHA1 signing) —
+  https://dev.to/ad1s0n/reverse-engineering-tp-link-tapos-rest-api-part-1-4g6
+- python-kasa `klaptransport.py` (KLAP = symmetric, local-only — not needed for cloud)
+- Cloudflare: Workers `fetch` trusts public CAs only / mTLS binding is client-cert only —
+  https://developers.cloudflare.com/workers/runtime-apis/bindings/mtls/
+</content>
