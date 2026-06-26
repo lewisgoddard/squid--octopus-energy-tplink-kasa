@@ -2003,3 +2003,21 @@ export default {
     }
   },
 }
+
+// Pure helpers exported for unit tests (see test/). The Worker runtime uses only
+// the default export above; these named exports are inert at runtime.
+export {
+  isBulb,
+  relayStateOf,
+  childrenFromSysinfo,
+  capsFromSysinfo,
+  factsFromSysinfo,
+  outletParent,
+  colorBandFor,
+  bandIndexFor,
+  colorConfigFromBody,
+  validateRuleBody,
+  ruleTargetError,
+  aggregateDays,
+  matchRoute,
+}
