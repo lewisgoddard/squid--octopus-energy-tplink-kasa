@@ -25,7 +25,9 @@ built and **gated** on this transport (`kasaSetTargetTemp` throws). See
   the write is missing.
 - **Tapo plugs/bulbs/strips** (P100/P110/P300, L530, …) — same SMART cloud; today invisible
   to Squid. P110 even exposes energy data.
-- **Newer Kasa "v2" firmware** on the V2 cloud.
+- **Newer Kasa "v2" firmware** — on the *same* V2 cloud (`n-wap.tplinkcloud.com`, also a
+  private CA), same protocol, just a different **cloud profile** (host + app keys). The relay
+  and transport must be designed profile-driven so Tapo and Kasa-v2 share one code path.
 
 ## Phase 0 findings (the open questions, answered)
 
@@ -144,8 +146,12 @@ Much smaller than the original crypto-heavy plan:
   app versions; copy from a current reference and expect to bump `appVer`.
 - **Account lockout / MFA** — V2 surfaces MFA + lockout error codes; reuse cached tokens,
   back off, surface clearly.
-- **Regional hosts** — saw `n-wap.i…`, `n-euw1-wap-gw…`, `euw1-app-server.iot.i.tplinknbu.com`;
-  the login/account-status call likely returns the right regional URL to use.
+- **Regional hosts** — TP-Link runs **3 regions** (DNS-confirmed; all other region codes
+  NXDOMAIN): `use1` (AWS us-east-1), `euw1` (eu-west-1), `aps1` (ap-southeast-1, Singapore),
+  on patterns `n-{region}-wap-gw.tplinkcloud.com` and `{region}-app-server.iot.i.tplinknbu.com`.
+  The base hosts `n-wap[.i].tplinkcloud.com` are **geo-routed**, so don't hardcode a region —
+  use the regional URL returned by `getAccountStatusAndUrl`/login. (`aps1`'s IPs are Singapore
+  despite the code; trust the resolved region, not the label.)
 
 ## Recommendation
 
@@ -177,7 +183,7 @@ Worker can't: terminate TLS to a private-CA origin and forward.
 
 | Concern | Where | Why |
 |---|---|---|
-| Per-user Tapo creds, login (`/api/v2/account/login`), token cache | **Worker + D1** (`tapo_tokens` by user_id) | secrets never live in the relay |
+| Per-user auth: MFA bootstrap, **refresh-token** store + refresh (Auth & 2FA below) | **Worker + D1** (`tapo_tokens` by user_id) | no passwords stored; secrets never in the relay |
 | HMAC-SHA1 request signing (Content-MD5 + X-Authorization) | **Worker** (`node:crypto`) | signature covers body/path/nonce only — unaffected by forwarding |
 | Building the call (method/params, `control_child`, query) | **Worker** | all SMART semantics stay in one place |
 | Retry / token refresh / lockout / rate-limit (per user) | **Worker** | |
@@ -186,12 +192,21 @@ Worker can't: terminate TLS to a private-CA origin and forward.
 **Interface (generic, no TP-Link knowledge in the Container):**
 - Worker → Container via a **Container binding** (DO-fronted; *not* a public URL), sending the
   fully-formed request: target URL + method + headers (incl. the signature) + body.
-- Container validates the host against an **allowlist (`*.tplinkcloud.com`)**, forwards with
-  the TP-Link CA trusted (`NODE_EXTRA_CA_CERTS=/certs/tplink-ca.pem`, or explicit `ca`), and
-  streams back `{status, headers, body}`. ~40 lines; reusable for any private-CA origin.
+- Container validates the host against an **allowlist (a set, not one glob)** and forwards with
+  the TP-Link CAs trusted (`NODE_EXTRA_CA_CERTS`, or explicit `ca`), streaming back
+  `{status, headers, body}`. ~40 lines; reusable for any private-CA origin.
+
+**Hosts & CAs (both private — confirmed):**
+- Allowlist: `*.tplinkcloud.com` (login/list/`passthrough`) **+ `*.tplinknbu.com` only if** the
+  NBU app-server (`{region}-app-server.iot.i.tplinknbu.com`, device `/v1/things/.../details`)
+  turns out to be needed — aim to do everything via `passthrough` and avoid it (open question).
+- **CA bundle must trust BOTH private roots:** *TP-Link Cloud Root CA* (→ Tapo
+  `n-wap.i.tplinkcloud.com`) **and** *TP-LINK CA P1* (→ Kasa-v2 `n-wap.tplinkcloud.com` **and**
+  `*.tplinknbu.com`). The earlier TLS spike embedded only the Tapo root; the real container
+  needs both.
 
 **Security:** binding-only (no public ingress) + host allowlist (no SSRF/open-proxy) +
-optional shared-secret header. CA baked into the image.
+optional shared-secret header. CAs baked into the image.
 
 **Consequences to accept (call these out):**
 1. **Credentials transit the relay.** To reach the private-CA host, the Container must
@@ -204,6 +219,46 @@ optional shared-secret header. CA baked into the image.
    the 30-min evaluate cron; adds a little latency to interactive control.
 3. The Container is shared across users and holds **no state** — all fan-out/keying is the
    Worker's, by `user_id`, exactly as today.
+
+## Cloud profiles — one transport for Tapo *and* Kasa v2
+
+The V2 protocol is identical across brands; only a few constants differ. Model a **profile**:
+
+| Profile | Host | appType / appName | App keys |
+|---|---|---|---|
+| Tapo | `n-wap.i.tplinkcloud.com` | `TP-Link_Tapo_Android` | Tapo AccessKey/SecretKey |
+| Kasa v2 | `n-wap.tplinkcloud.com` | `Kasa_Android_Mix` | Kasa AccessKey/SecretKey |
+
+Same login path, same HMAC-SHA1 signing, same `/api/v2/common/passthrough`. The transport
+takes a profile; the relay is profile-agnostic (host allowlist covers both V2 hosts). A device's
+profile comes from which login enumerated it. (Legacy Kasa stays on the **V1** public-cert path
+Squid uses today — no relay, no change.)
+
+**Open question — do we touch the NBU host?** Everything for control should be reachable via
+`/api/v2/common/passthrough` on `*.tplinkcloud.com` (`set_device_info`, `get_device_info`,
+`get_child_device_list`). The separate NBU app-server (`*.tplinknbu.com`, `/v1/things/.../details`,
+`Authorization: ut|<token>`) is an app convenience and **also private-CA** ("TP-LINK CA P1"). Aim
+to avoid it; if a required read proves NBU-only, add `*.tplinknbu.com` to the relay allowlist (the
+CA bundle already needs that root for Kasa-v2).
+
+## Auth & 2FA (multi-user) — keep 2FA on
+
+The V2 cloud is MFA-aware (`/api/v2/account/checkMFACodeAndLogin`, `/api/v2/account/refreshToken`,
+errors `MFA_REQUIRED -20677`, `TOKEN_EXPIRED -20651`, `REFRESH_TOKEN_EXPIRED -20655`). So instead
+of requiring 2FA to be **off**, do a **refresh-token bootstrap**:
+
+1. **One-time bootstrap** (per user, interactive): username/password → if `MFA_REQUIRED`, user
+   submits their code via `checkMFACodeAndLogin` → returns access token **+ refresh token**.
+2. **Store the refresh token** per user in D1 (`tapo_tokens`: `user_id, profile, refresh_token,
+   access_token, expires_at`). **Never store the password.**
+3. **Refresh thereafter** (`refreshToken`) for short-lived access tokens — no password, no MFA.
+4. **On `REFRESH_TOKEN_EXPIRED`** → prompt a re-bootstrap (surface clearly; don't silently fail).
+
+This makes 2FA a one-time setup rather than a blocker, and is a better security posture than the
+current single-user `TPLINK_USERNAME`/`TPLINK_PASSWORD` secrets (which only work with 2FA off).
+A new bootstrap endpoint (`POST /api/tapo/bootstrap` { username, password, mfa_code? }) is the
+main new surface. **To verify:** exact MFA request/response shape, refresh-token lifetime, and
+whether a stable `terminalUUID` reduces MFA prompts.
 
 ## Sources
 

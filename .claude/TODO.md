@@ -46,5 +46,7 @@
         CONFIRMED via deployed spike: a pure Worker CANNOT reach the Tapo V2 cloud — fetch→526
         (private CA), node:tls won't socket to a web service. ⇒ needs a RELAY. Chosen shape:
         minimal STATELESS passthrough Container (CA-trusting HTTPS forwarder, host-allowlisted,
-        binding-only) — Worker keeps ALL per-user auth/login/HMAC-signing/token cache; container
-        holds no creds. Next: container spike to prove a Container reaches the Tapo cloud.
+        binding-only) — Worker keeps ALL per-user auth/HMAC-signing/tokens; container holds no
+        creds. Profile-driven: same transport for Tapo AND Kasa v2 (host + app keys differ).
+        Auth: refresh-token bootstrap (MFA once → store refresh token per user) so 2FA stays ON,
+        no passwords stored. Next: container spike to prove a Container reaches the V2 cloud.
