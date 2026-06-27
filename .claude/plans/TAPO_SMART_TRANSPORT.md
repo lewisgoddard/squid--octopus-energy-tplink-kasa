@@ -115,8 +115,12 @@ Much smaller than the original crypto-heavy plan:
 - `tapoToken(env)` — V2 login to the Tapo host, cache token+refresh (new `tapo_tokens` row).
 - `signV2(bodyJson, path)` — Content-MD5 + X-Authorization (md5 + HMAC-SHA1, `node:crypto`).
 - `smartCall(env, dev, method, params, childId?)` — signed `POST /api/v2/common/passthrough`
-  with `requestData = {method, params}` (wrap a hub child in `control_child`). Reachability
-  via whatever the TLS spike proves (`node:tls` socket or relay).
+  with `requestData = {method, params}` (wrap a hub child in `control_child`), sent through
+  the relay binding. **Must be boot-tolerant:** the relay scales to zero, so a call often
+  cold-starts the container (~1–3s; the helper waits, up to ~20s port-ready). Give the relay
+  call a timeout + **one retry** (the retry lands on a now-warm instance) and surface a clean
+  skip on failure rather than hanging — the evaluate cron and manual control both tolerate
+  the few-second first-call latency.
 - `kasaSetTargetTemp` (currently throws) → `smartCall("set_device_info", {target_temp})`.
 - **Transport selection:** tag each snapshot device `proto: "iot" | "smart"`; route reads/
   writes accordingly. Rule engine, `resolveTarget`/`hubOf`, snapshot, endpoints stay

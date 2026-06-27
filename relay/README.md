@@ -65,6 +65,10 @@ with real responses); only the Cloudflare Container deploy needs the account ent
   instance (`getContainer(env.RELAY, "relay")`). The forwarder is stateless and I/O-bound, so
   one instance handles the half-hourly cron + manual control comfortably, and it scales to
   zero between uses (`sleepAfter`).
+- **Cold start ~1–3s.** Because it scales to zero, the first call after idle boots the
+  container (the tiny image stays well under the helper's ~20s port-ready window); `.fetch()`
+  waits for readiness rather than failing. The caller should still use a timeout + one retry
+  to tolerate the occasional slow boot.
 - **To scale later** (only if concurrency demands it): raise `max_instances` and load-balance
   across interchangeable instances with `getRandom(env.RELAY, N)` instead of the fixed name —
   no state or affinity to worry about.
