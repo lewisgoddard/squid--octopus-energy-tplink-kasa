@@ -7,7 +7,14 @@ compatibility_date = "2026-06-08"
 [[containers]]
 class_name = "TapoRelay"
 image = "./Dockerfile"
-max_instances = 3
+# Stateless forwarder — one instance is plenty (scale-to-zero between uses). To scale,
+# raise this and load-balance with getRandom() in worker.mjs (see relay/README.md).
+max_instances = 1
+
+  # Keep the relay in the EU (it transits per-user TP-Link traffic). `jurisdiction = "eu"`
+  # is a compliance boundary (EU data centres only: EEUR/WEUR).
+  [containers.constraints]
+  jurisdiction = "eu"
 
 [[durable_objects.bindings]]
 name = "RELAY"
@@ -17,7 +24,8 @@ class_name = "TapoRelay"
 tag = "v1"
 new_sqlite_classes = ["TapoRelay"]
 
-# Shared secret gating the relay (set a real one via `wrangler secret put RELAY_SECRET`
-# for anything beyond a throwaway test).
-[vars]
-RELAY_SECRET = "spike-only-change-me"
+# RELAY_SECRET gates the relay and is a SECRET, not a var — deliberately NOT declared
+# here. A committed `[vars] RELAY_SECRET` would be re-applied (in plaintext) on every
+# `wrangler deploy`, overriding the value set via `wrangler secret put` and leaking it
+# into git. Set it once with `wrangler secret put RELAY_SECRET` (persists across deploys);
+# for local dev put it in `relay/.dev.vars`. The Worker fails closed (401) until it's set.

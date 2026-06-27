@@ -190,7 +190,8 @@ Worker can't: terminate TLS to a private-CA origin and forward.
 > Unauthorized`: **Containers isn't enabled on the account** (needs a Workers **Paid** plan +
 > Containers onboarding). Once enabled, `cd relay && wrangler deploy` should just work — then
 > the deployed end-to-end test (Worker→Container→Tapo, expect the 405 JSON not a TLS error).
-> Set a real `RELAY_SECRET` (not the placeholder) before any non-throwaway deploy.
+> Set `RELAY_SECRET` via `wrangler secret put` (it's a secret, not a `[vars]` entry — the
+> Worker fails closed/401 until it's set, and secrets survive automated deploys).
 
 **Responsibility split (multi-user safe):**
 

@@ -38,9 +38,14 @@ Requires **Containers enabled** on the account (Workers Paid plan). Then:
 ```bash
 cd relay
 npm ci
-npx wrangler secret put RELAY_SECRET   # replace the wrangler.toml placeholder
+npx wrangler secret put RELAY_SECRET   # required — the Worker 401s until this is set
 npx wrangler deploy
 ```
+
+`RELAY_SECRET` is a **secret**, not a `[vars]` entry — secrets persist across deploys and
+aren't clobbered, so an automated (e.g. GitHub Actions) `wrangler deploy` keeps it intact.
+Never add it to `wrangler.toml`'s `[vars]`: that committed plaintext would override the
+secret on every deploy. (For local dev, put it in `relay/.dev.vars`.)
 
 Validate end-to-end (expect a real TP-Link JSON error, not a TLS failure):
 
@@ -53,3 +58,18 @@ curl -H "x-relay-secret: <secret>" \
 
 The forwarder logic + CA bundle are validated locally (it forwards to all three V2 hosts
 with real responses); only the Cloudflare Container deploy needs the account entitlement.
+
+## Scaling & placement
+
+- **One instance today.** `max_instances = 1`, and `worker.mjs` routes to a single named
+  instance (`getContainer(env.RELAY, "relay")`). The forwarder is stateless and I/O-bound, so
+  one instance handles the half-hourly cron + manual control comfortably, and it scales to
+  zero between uses (`sleepAfter`).
+- **To scale later** (only if concurrency demands it): raise `max_instances` and load-balance
+  across interchangeable instances with `getRandom(env.RELAY, N)` instead of the fixed name —
+  no state or affinity to worry about.
+- **Placement: EU.** `[containers.constraints] jurisdiction = "eu"` pins the instance to EU
+  data centres (a compliance boundary), since it transits per-user TP-Link traffic. Each
+  instance runs in a single location regardless (containers are Durable-Object-backed); the
+  constraint just bounds *which* region. Swap to `regions = ["WEUR"]` for nearest-to-UK
+  geographic placement without the EU-only boundary.

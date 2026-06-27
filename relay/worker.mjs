@@ -9,7 +9,7 @@ import { Container, getContainer } from "@cloudflare/containers"
 
 export class TapoRelay extends Container {
   defaultPort = 8080      // forwarder.mjs listens here
-  sleepAfter = "5m"       // scale to zero between uses
+  sleepAfter = "1m"       // scale to zero between uses
   enableInternet = true   // must reach the TP-Link cloud
 }
 
