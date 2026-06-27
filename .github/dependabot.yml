@@ -3,7 +3,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
     groups:
       github-actions-patching:
         update-types:
@@ -14,7 +14,7 @@ updates:
   - package-ecosystem: "npm"
     directory: "/squid"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
     allow:
       - dependency-type: "all"
     groups:
@@ -27,7 +27,7 @@ updates:
   - package-ecosystem: "npm"
     directory: "/relay"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
     allow:
       - dependency-type: "all"
     groups:
@@ -40,7 +40,7 @@ updates:
   - package-ecosystem: "docker"
     directory: "/relay"
     schedule:
-      interval: "monthly"
+      interval: "weekly"
     groups:
       docker-patching:
         update-types:
