@@ -67,6 +67,7 @@ Update `wrangler.toml` with your D1 `database_id`:
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
+   npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [tapo_tokens] (user_id text, profile text, terminal_uuid text, refresh_token text, access_token text, token_expiry integer, updated_at text, PRIMARY KEY (user_id, profile))"
    npx wrangler d1 execute kraken-db --remote --command "CREATE TABLE IF NOT EXISTS [device_cache] (user_id text PRIMARY KEY, json text, updated_at text)"
    ```
 
@@ -132,10 +133,25 @@ CREATE TABLE IF NOT EXISTS [device_log] (
     reason      text
 );
 
+-- V1 Kasa cloud token (the legacy `wap.tplinkcloud.com` transport, public CA).
 CREATE TABLE IF NOT EXISTS [tplink_tokens] (
     user_id    text PRIMARY KEY,
     token      text,
     updated_at text
+);
+
+-- V2 (Tapo / Kasa-v2) cloud tokens, one row per (user, profile). The refresh token (from the
+-- first login / MFA bootstrap) mints short-lived access tokens without re-sending the password.
+-- Reached only through the relay (private CA); see ../relay/README.md.
+CREATE TABLE IF NOT EXISTS [tapo_tokens] (
+    user_id       text,
+    profile       text,            -- 'tapo' | 'kasa_v2'
+    terminal_uuid text,            -- stable per (user, profile)
+    refresh_token text,            -- long-lived; null until first login
+    access_token  text,            -- short-lived
+    token_expiry  integer,         -- epoch ms; refresh/login once past
+    updated_at    text,
+    PRIMARY KEY (user_id, profile)
 );
 
 -- Cron-refreshed snapshot of the TP-Link device list (ids/names/online), served
@@ -194,6 +210,7 @@ npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS 
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [rule_devices] (rule_id text, device_id text, user_id text, PRIMARY KEY (rule_id, device_id))"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_log] (id integer PRIMARY KEY AUTOINCREMENT, device_id text, user_id text, ts text, action text, price real, reason text)"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tplink_tokens] (user_id text PRIMARY KEY, token text, updated_at text)"
+npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [tapo_tokens] (user_id text, profile text, terminal_uuid text, refresh_token text, access_token text, token_expiry integer, updated_at text, PRIMARY KEY (user_id, profile))"
 npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS [device_cache] (user_id text PRIMARY KEY, json text, updated_at text)"
 ```
 

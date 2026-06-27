@@ -13,4 +13,8 @@ interface Env {
   TPLINK_USERNAME: string
   TPLINK_PASSWORD: string
   SQUID_API_KEY: string
+  // Service binding to the `tapo-relay` Worker (the V2 cloud passthrough). Declared here so
+  // smartCall type-checks now; the actual [[services]] binding is added to wrangler.toml at
+  // integration, once tapo-relay is deployed (adding it sooner would break kraken's deploy).
+  RELAY: Fetcher
 }

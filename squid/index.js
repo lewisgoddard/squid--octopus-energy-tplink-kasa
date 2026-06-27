@@ -1,3 +1,5 @@
+import { createHash, createHmac } from "node:crypto"
+
 /**
  * A device as returned by the TP-Link Kasa cloud `getDeviceList` call.
  * @typedef {Object} KasaDevice
@@ -557,6 +559,118 @@ async function kasaSetColor(env, dev, colour) {
   })
 }
 
+// TP-Link's V2 cloud (Tapo / Kasa-v2) signs every request with a hardcoded timestamp; the
+// per-request nonce provides uniqueness. (Matches the TP-Link app + piekstra/tplink-cloud-api.)
+const V2_SIGNING_TIMESTAMP = "9999999999"
+
+/**
+ * V2 cloud profiles — the constants that differ between Tapo and newer "Kasa v2" devices.
+ * `accessKey`/`secretKey` are app-identity keys from the TP-Link APKs (NOT user secrets — they
+ * sign every V2 request). `host` is the login/passthrough base; at runtime
+ * `getAccountStatusAndUrl` returns the account's regional host, so don't hardcode a region.
+ * The relay's allowlist covers both. @see {@link signV2}
+ * @type {Record<"tapo" | "kasa_v2", { host: string, appType: string, accessKey: string, secretKey: string }>}
+ */
+const V2_PROFILES = {
+  tapo: {
+    host: "https://n-wap.i.tplinkcloud.com",
+    appType: "TP-Link_Tapo_Android",
+    accessKey: "4d11b6b9d5ea4d19a829adbb9714b057",
+    secretKey: "6ed7d97f3e73467f8a5bab90b577ba4c",
+  },
+  kasa_v2: {
+    host: "https://n-wap.tplinkcloud.com",
+    appType: "Kasa_Android_Mix",
+    accessKey: "e37525375f8845999bcc56d5e6faa76d",
+    secretKey: "314bc6700b3140ca80bc655e527cb062",
+  },
+}
+
+const V2_PATHS = { login: "/api/v2/account/login", passthrough: "/api/v2/common/passthrough" }
+
+/**
+ * Builds the V2 login request (exact JSON string body, for signing + sending). Same shape for
+ * both profiles; the `appType` differs. `refreshTokenNeeded` asks for a refresh token so we
+ * never have to re-send the password.
+ * @param {{ appType: string }} profile
+ * @param {{ username: string, password: string, terminalUUID: string }} creds
+ * @returns {{ path: string, body: string }}
+ */
+function buildV2Login(profile, creds) {
+  return {
+    path: V2_PATHS.login,
+    body: JSON.stringify({
+      appType: profile.appType,
+      cloudUserName: creds.username,
+      cloudPassword: creds.password,
+      terminalUUID: creds.terminalUUID,
+      refreshTokenNeeded: true,
+    }),
+  }
+}
+
+/**
+ * Builds the V2 token-refresh request — the MFA-safe path that swaps a stored refresh token for
+ * a fresh access token without re-sending the password (so 2FA can stay on). Reuses the login
+ * endpoint with a `refreshToken` instead of credentials.
+ * NOTE: the exact body shape is reconstructed from references and awaits live validation against
+ * the relay; only the *decision* to take this path (see {@link tapoToken}) is unit-tested.
+ * @param {{ appType: string }} profile
+ * @param {{ refreshToken: string, terminalUUID: string }} args
+ * @returns {{ path: string, body: string }}
+ */
+function buildV2Refresh(profile, args) {
+  return {
+    path: V2_PATHS.login,
+    body: JSON.stringify({ appType: profile.appType, terminalUUID: args.terminalUUID, refreshToken: args.refreshToken }),
+  }
+}
+
+/**
+ * Builds the V2 `passthrough` request. The cloud body is `{ deviceId, requestData: "<json>" }`
+ * where `requestData` is the (stringified) device command. For a whole SMART device that's
+ * `{ method, params }`; for a hub child (a KE100 TRV under a KH100), it's wrapped in
+ * `control_child` addressed to `childId` — there the inner `requestData` is a nested object,
+ * not a string (the SMART hub convention).
+ * @param {string} deviceId - the device, or the hub when targeting a child.
+ * @param {string} method - e.g. "set_device_info" / "get_device_info".
+ * @param {any} params
+ * @param {string | null} [childId] - the hub child's device id, when applicable.
+ * @returns {{ path: string, body: string }}
+ */
+function buildV2Passthrough(deviceId, method, params, childId) {
+  const inner = childId
+    ? { method: "control_child", params: { device_id: childId, requestData: { method, params } } }
+    : { method, params }
+  return {
+    path: V2_PATHS.passthrough,
+    body: JSON.stringify({ deviceId, requestData: JSON.stringify(inner) }),
+  }
+}
+
+/**
+ * Signs a TP-Link V2 cloud request (the app's HMAC-SHA1 scheme). Returns the `Content-MD5`
+ * and `X-Authorization` headers to send alongside `bodyJson` to `urlPath`.
+ *   Content-MD5     = base64(md5(bodyJson))
+ *   sigString       = `${Content-MD5}\n${timestamp}\n${nonce}\n${urlPath}`
+ *   X-Authorization = `Timestamp=…, Nonce=…, AccessKey=…, Signature=hex(hmacSHA1(secretKey, sigString))`
+ * @param {string} bodyJson - the exact JSON string sent as the request body.
+ * @param {string} urlPath - the request path WITHOUT query, e.g. "/api/v2/common/passthrough".
+ * @param {{ accessKey: string, secretKey: string, nonce?: string }} app - app keys for the
+ *   cloud profile; `nonce` is injectable for deterministic tests (defaults to a random UUID).
+ * @returns {{ "Content-MD5": string, "X-Authorization": string }}
+ */
+function signV2(bodyJson, urlPath, app) {
+  const contentMd5 = createHash("md5").update(bodyJson).digest("base64")
+  const nonce = app.nonce ?? crypto.randomUUID()
+  const sigString = `${contentMd5}\n${V2_SIGNING_TIMESTAMP}\n${nonce}\n${urlPath}`
+  const signature = createHmac("sha1", app.secretKey).update(sigString).digest("hex")
+  return {
+    "Content-MD5": contentMd5,
+    "X-Authorization": `Timestamp=${V2_SIGNING_TIMESTAMP}, Nonce=${nonce}, AccessKey=${app.accessKey}, Signature=${signature}`,
+  }
+}
+
 /**
  * Calls the TP-Link V2 cloud relay (the service-bound `tapo-relay` Worker → its CA-trusting
  * container) to make one HTTPS request to `targetUrl` — an absolute https URL on a TP-Link V2
@@ -606,19 +720,100 @@ async function relayFetch(relay, targetUrl, init = {}, opts = {}) {
 }
 
 /**
- * Sets a hub-connected TRV's target temperature (°C).
+ * One signed V2 cloud request through the relay: signs `bodyJson` for `path`, POSTs it to the
+ * profile host (adding `?token=` when authenticated), and unwraps the `{ error_code, result }`
+ * envelope. The token is NOT part of the signed path (it's a query param, like V1).
+ * @param {Env} env
+ * @param {{ host: string, appType: string, accessKey: string, secretKey: string }} profile
+ * @param {string} path
+ * @param {string} bodyJson
+ * @param {string} [token]
+ * @returns {Promise<any>} the `result` object. @throws on a non-zero `error_code`.
+ */
+async function v2Post(env, profile, path, bodyJson, token) {
+  const url = `${profile.host}${path}${token ? `?token=${encodeURIComponent(token)}` : ""}`
+  const headers = { "content-type": "application/json", ...signV2(bodyJson, path, profile) }
+  const res = await relayFetch(env.RELAY, url, { method: "POST", headers, body: bodyJson })
+  const data = /** @type {any} */ (await res.json())
+  if (!data || data.error_code !== 0) {
+    throw new Error(`TP-Link V2 error ${data?.error_code}: ${data?.msg || JSON.stringify(data)}`)
+  }
+  return data.result
+}
+
+/**
+ * Returns a valid V2 access token for `profileName` ("tapo" | "kasa_v2"), minting one when the
+ * cached token is missing/expired (or `forceNew`). Prefers the stored refresh token (MFA-safe,
+ * no password sent); falls back to a password login, which is the non-MFA bootstrap and also
+ * returns a refresh token for next time. Tokens are cached per (user, profile) in `tapo_tokens`.
+ * @param {Env} env
+ * @param {"tapo" | "kasa_v2"} profileName
+ * @param {boolean} forceNew
+ * @returns {Promise<string>}
+ */
+async function tapoToken(env, profileName, forceNew) {
+  const profile = V2_PROFILES[profileName]
+  /** @type {{ terminal_uuid: string, refresh_token: string | null, access_token: string | null, token_expiry: number | null } | null} */
+  const row = await env.DATABASE.prepare(
+    "SELECT terminal_uuid, refresh_token, access_token, token_expiry FROM tapo_tokens WHERE user_id = ? AND profile = ?"
+  ).bind(env.USER_ID, profileName).first()
+  const now = Date.now()
+  if (!forceNew && row?.access_token && typeof row.token_expiry === "number" && row.token_expiry > now) {
+    return row.access_token
+  }
+  const terminalUUID = row?.terminal_uuid || crypto.randomUUID()
+  const req = row?.refresh_token
+    ? buildV2Refresh(profile, { refreshToken: row.refresh_token, terminalUUID })
+    : buildV2Login(profile, { username: env.TPLINK_USERNAME, password: env.TPLINK_PASSWORD, terminalUUID })
+  const result = await v2Post(env, profile, req.path, req.body)
+  // V2 access tokens are short-lived; `expire` (seconds) is returned on login. Refresh a minute
+  // early. Keep the existing refresh token if the response doesn't carry a new one.
+  const expiry = now + (typeof result.expire === "number" ? result.expire * 1000 : 24 * 3600 * 1000) - 60_000
+  await env.DATABASE.prepare(
+    "INSERT INTO tapo_tokens (user_id, profile, terminal_uuid, refresh_token, access_token, token_expiry, updated_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, profile) DO UPDATE SET " +
+      "terminal_uuid = excluded.terminal_uuid, refresh_token = excluded.refresh_token, " +
+      "access_token = excluded.access_token, token_expiry = excluded.token_expiry, updated_at = excluded.updated_at"
+  ).bind(
+    env.USER_ID, profileName, terminalUUID,
+    result.refreshToken || row?.refresh_token || null, result.token, expiry, new Date().toISOString()
+  ).run()
+  return result.token
+}
+
+/**
+ * Sends one SMART/Tapo command via the V2 cloud (through the relay) and returns the device's
+ * parsed response. Re-authenticates once on failure (the cached token may be stale), mirroring
+ * the V1 `tplinkCall` retry. For a hub child (TRV), pass `childId` to wrap it in `control_child`.
+ * @param {Env} env
+ * @param {"tapo" | "kasa_v2"} profileName
+ * @param {string} deviceId - the device, or the hub when targeting a child.
+ * @param {string} method
+ * @param {any} params
+ * @param {string | null} [childId]
+ * @returns {Promise<any>}
+ */
+async function smartCall(env, profileName, deviceId, method, params, childId) {
+  const profile = V2_PROFILES[profileName]
+  const { path, body } = buildV2Passthrough(deviceId, method, params, childId ?? null)
+  let result
+  try {
+    result = await v2Post(env, profile, path, body, await tapoToken(env, profileName, false))
+  } catch {
+    result = await v2Post(env, profile, path, body, await tapoToken(env, profileName, true))
+  }
+  return JSON.parse(result.responseData)
+}
+
+/**
+ * Sets a hub-connected TRV's target temperature (°C) via the SMART/Tapo cloud transport.
  *
- * NOT YET WIRED. KE100/KH100 speak the SMART/Tapo protocol — python-kasa sets the
- * target via `set_device_info {"target_temp": <c>}`, reached through an encrypted
- * `securePassthrough` after a Tapo (`TP-Link_Tapo_Android`) login and addressed on
- * the hub with `control_child` / `child_ids`. Squid's cloud transport is Kasa IOT
- * (`appType: Kasa_Android`, plain `passthrough`), which can't carry SMART commands,
- * so sending over it would be wrong rather than merely unverified. Throws until the
- * SMART/Tapo transport exists; the evaluate setpoint pass reports the intended
- * temperature and skips the send. The intended payload, for when that lands:
- *   securePassthrough → { method: "control_child", params: {
- *     device_id: childId,
- *     requestData: { method: "set_device_info", params: { target_temp: tempC } } } }
+ * KE100/KH100 speak SMART: the target is set with `set_device_info {"target_temp": <c>}`,
+ * addressed on the hub with `control_child` when hub-connected (`childId`), else sent to the
+ * thermostat directly. Goes through {@link smartCall} → the relay (the V2 cloud uses a private
+ * CA a Worker can't reach directly). Until the `tapo-relay` service binding is deployed and
+ * added to wrangler.toml, `env.RELAY` is undefined and this throws a clear error; the evaluate
+ * setpoint pass then reports the intended temperature and skips the send.
  * @param {Env} env
  * @param {KasaDevice} dev - the hub (or the thermostat itself, if standalone).
  * @param {string | null} childId - the TRV's device id when hub-connected, else null.
@@ -626,8 +821,10 @@ async function relayFetch(relay, targetUrl, init = {}, opts = {}) {
  * @returns {Promise<void>}
  */
 async function kasaSetTargetTemp(env, dev, childId, tempC) {
-  void env; void dev; void childId; void tempC
-  throw new Error("TRV setpoint needs the SMART/Tapo cloud transport (not yet implemented)")
+  if (!env.RELAY) {
+    throw new Error("TRV setpoint needs the tapo-relay service binding (deploy the relay + add the binding first)")
+  }
+  await smartCall(env, "tapo", dev.deviceId, "set_device_info", { target_temp: tempC }, childId)
 }
 
 /**
@@ -2198,4 +2395,11 @@ export {
   aggregateDays,
   matchRoute,
   relayFetch,
+  signV2,
+  V2_PROFILES,
+  buildV2Login,
+  buildV2Refresh,
+  buildV2Passthrough,
+  tapoToken,
+  smartCall,
 }

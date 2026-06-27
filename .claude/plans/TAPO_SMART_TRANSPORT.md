@@ -4,10 +4,14 @@ How Squid would talk to TP-Link's newer **SMART** protocol (Tapo-branded devices
 newer Kasa firmware) over the cloud — the prerequisite that unblocks **TRV setpoints**
 (KE100/KH100) and brings **Tapo plugs/bulbs/strips** into the same rate automation.
 
-Status: **Phase 0 (research) done — see findings below.** The Tier-3 rule model (`invert` +
-setpoint, inverted `cheaper_than_gas`, the evaluate setpoint pass, `hubOf`) is already
-built and **gated** on this transport (`kasaSetTargetTemp` throws). See
-[DEVICE_SUPPORT.md](DEVICE_SUPPORT.md) Tier 3.
+Status: **Research + the whole Worker-side transport are built & tested offline (46 tests, tsc
+clean).** `signV2` (cross-checked vs openssl), `V2_PROFILES`, the builders, `tapoToken`,
+`smartCall`, and `kasaSetTargetTemp`→`smartCall` (guarded on `env.RELAY`) all exist in
+`squid/index.js`. **What's left is live integration, gated on the Containers entitlement:** deploy
+`tapo-relay`, add the `[[services]]` binding, create the `tapo_tokens` table, then validate the
+login/refresh wire shapes + MFA refresh-token bootstrap against the live cloud. The Tier-3 rule
+model (`invert` + setpoint, inverted `cheaper_than_gas`, the evaluate setpoint pass, `hubOf`) is
+built and now writes through `smartCall`. See [DEVICE_SUPPORT.md](DEVICE_SUPPORT.md) Tier 3.
 
 > **⛔ Headline result (CONFIRMED on production workerd): a Worker can't reach the Tapo
 > cloud.** The protocol is *simpler* than feared (second login + HMAC-SHA1 signing + a
@@ -124,13 +128,19 @@ kraken's live deploys.
   `test/relay.test.js`). Boot-tolerant relay client: `env.RELAY.fetch` with the target in
   `X-Forward-To`, `timeout` (default 30s, > the container's ~20s port-ready window) + **one
   retry**; returns upstream HTTP errors (doesn't retry them), throws cleanly on exhaustion.
-- `tapoToken(env)` — V2 login to the Tapo host, cache token+refresh (new `tapo_tokens` row).
-- `signV2(bodyJson, path)` — Content-MD5 + X-Authorization (md5 + HMAC-SHA1, `node:crypto`).
-- `smartCall(env, dev, method, params, childId?)` — builds + signs the `POST /api/v2/common/
-  passthrough` (`requestData = {method, params}`, wrap a hub child in `control_child`) and sends
-  it via `relayFetch(env.RELAY, …)`. The evaluate cron and manual control both tolerate the
-  few-second first-call (cold-start) latency.
-- `kasaSetTargetTemp` (currently throws) → `smartCall("set_device_info", {target_temp})`.
+- `signV2(bodyJson, path, app)` — ✅ **built + cross-checked vs openssl** (`test/sign.test.js`).
+  Content-MD5 + X-Authorization (md5 + HMAC-SHA1, `node:crypto` via `nodejs_compat` + a minimal
+  `node-crypto.d.ts` shim). Hardcoded timestamp `9999999999`; per-request UUID nonce.
+- `V2_PROFILES` + builders — ✅ **built + tested** (`test/v2.test.js`). `V2_PROFILES.{tapo,kasa_v2}`
+  (host/appType/app-keys), `buildV2Login` / `buildV2Refresh` / `buildV2Passthrough` (the last wraps
+  a hub child in `control_child`). `buildV2Refresh`'s body shape is flagged — awaits live validation.
+- `tapoToken(env, profile, forceNew)` — ✅ **built + tested** (`test/transport.test.js`). Per-
+  `(user, profile)` cache in `tapo_tokens`; refresh-token-first (MFA-safe), password-login fallback.
+- `smartCall(env, profile, deviceId, method, params, childId?)` — ✅ **built + tested**. Builds +
+  signs the `POST /api/v2/common/passthrough` and sends via `relayFetch(env.RELAY, …)`, unwraps
+  `responseData`, re-auths once on failure. Cron + manual control tolerate the cold-start latency.
+- `kasaSetTargetTemp` — ✅ **now calls** `smartCall("set_device_info", {target_temp})`, guarded on
+  `env.RELAY` (clear error until the binding exists). `RELAY` typed in `worker-env.d.ts`.
 - **Transport selection:** tag each snapshot device `proto: "iot" | "smart"`; route reads/
   writes accordingly. Rule engine, `resolveTarget`/`hubOf`, snapshot, endpoints stay
   protocol-agnostic.
@@ -144,12 +154,16 @@ kraken's live deploys.
    validated first by a **container spike**: forward one request to `n-wap.i.tplinkcloud.com`
    from a Container called by a Worker, and confirm it gets past the cert (expect 405/JSON,
    not 526). Proves the architecture before building the transport.
-3. **Login + device list** — `tapoToken` + signing **in the Worker**, sent *through* the
-   relay; signed V2 `getDeviceListByPage`.
-4. **One Tapo plug end-to-end** — read + on/off via signed `passthrough`. Validates auth +
-   signing + transport before hubs.
-5. **Hub children** — `control_child` for KE100; un-gate `kasaSetTargetTemp`.
-6. **Integrate** — `proto` routing; Tapo plugs/bulbs join the existing on/off + colour rules.
+3. **✅ Worker-side transport built (offline)** — `signV2` (cross-checked vs openssl), profiles,
+   builders, `tapoToken`, `smartCall`, `kasaSetTargetTemp`→`smartCall`. 46 tests / tsc clean.
+   The remaining work in phases 3–5 is **live validation through the deployed relay**, so it's
+   all gated on Phase 2 (the relay deploy, which needs the Containers entitlement):
+   - **Login + device list** — confirm the live login round-trip + add signed `getDeviceListByPage`
+     (and validate `buildV2Refresh`'s body shape, currently flagged).
+   - **One Tapo plug end-to-end** — read + on/off via signed `passthrough`; MFA refresh-token bootstrap.
+   - **Hub children** — confirm `control_child` for KE100 against real hardware refs; ungate is done
+     (guarded on `env.RELAY`).
+4. **Integrate** — `proto` routing; Tapo plugs/bulbs join the existing on/off + colour rules.
 
 ## Risks & constraints
 

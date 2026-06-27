@@ -37,9 +37,9 @@
   - [~] Tier 3 — heating (TRV setpoint): rule model DONE — `invert` flag (flips any
         strategy; usable now on on/off devices) + setpoint mode (`comfort_c`/`setback_c`)
         driving a TRV, gated thru ruleTargetError (setpoint↔thermostat). Evaluate has a
-        setpoint pass computing the target temp. BLOCKED on transport: KE100 is SMART/Tapo
-        protocol (set_device_info{target_temp} via securePassthrough), so kasaSetTargetTemp
-        throws "needs SMART transport" — the actual write awaits the Tapo cloud layer.
+        setpoint pass computing the target temp. Transport now BUILT: kasaSetTargetTemp calls
+        smartCall (set_device_info{target_temp} via the V2 cloud + control_child), guarded on
+        env.RELAY — the actual write just awaits the relay deploy + service binding (see below).
   - [ ] Tapo/SMART cloud transport — unblocks TRV writes AND Tapo plugs/bulbs (cross-cutting
         #4). Plan: plans/TAPO_SMART_TRANSPORT.md. Phase 0+1 DONE. Protocol is simple (Tapo V2
         login + HMAC-SHA1 signing + plaintext /api/v2/common/passthrough; NO device crypto).
@@ -61,6 +61,16 @@
           (env.RELAY.fetch + X-Forward-To, timeout 30s + 1 retry, returns HTTP errors). The
           kraken-side [[services]] binding is DEFERRED to integration (don't add to live
           squid/wrangler.toml until tapo-relay is deployed, or it breaks kraken's deploy).
-    - [ ] After relay deploys: add the service binding; build the rest of the SMART transport
-          (tapoToken + signV2 HMAC-SHA1 + smartCall via relayFetch) + refresh-token bootstrap;
-          un-gate kasaSetTargetTemp.
+    - [x] V2 transport BUILT (squid/index.js + test/{sign,v2,transport}.test.js, all offline):
+          signV2 (Content-MD5 + HMAC-SHA1, CROSS-CHECKED vs openssl), V2_PROFILES (Tapo + Kasa-v2
+          hosts/appType/app-keys from the APKs — not user secrets), buildV2Login/buildV2Refresh/
+          buildV2Passthrough (control_child wrap for hub children), tapoToken (per-(user,profile)
+          cache in tapo_tokens; refresh-token-first, password-login fallback), smartCall (sign →
+          relayFetch → unwrap responseData, re-auth once on failure). Added nodejs_compat for
+          node:crypto + a minimal node-crypto.d.ts shim (avoids @types/node global conflicts).
+          kasaSetTargetTemp now calls smartCall, guarded on env.RELAY (RELAY typed in
+          worker-env.d.ts; the [[services]] binding stays OUT of wrangler.toml until deploy).
+    - [ ] LIVE INTEGRATION (needs Containers enabled): cd relay && wrangler deploy; add the
+          [[services]] binding to squid/wrangler.toml; create the tapo_tokens table in D1; then
+          live-validate the login/refresh wire shapes (buildV2Refresh body is flagged unverified)
+          and the MFA refresh-token bootstrap (the one-time 2FA exchange that seeds refresh_token).

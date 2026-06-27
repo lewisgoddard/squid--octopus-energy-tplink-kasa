@@ -1,6 +1,8 @@
 name = "kraken"
 main = "index.js"
 compatibility_date = "2026-06-01"
+# node:crypto (MD5 + HMAC-SHA1) for the Tapo/Kasa-v2 V2 request signing (signV2).
+compatibility_flags = ["nodejs_compat"]
 
 [triggers]
 # 32 * * * *    -> refresh Octopus rates (hourly; updateRates skips the API pull
