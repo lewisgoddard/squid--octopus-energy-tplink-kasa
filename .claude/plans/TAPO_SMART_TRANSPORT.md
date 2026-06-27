@@ -84,8 +84,8 @@ Probably, for the cloud path — unless one of these works:
 
 ## Phase 1 — TLS spike result
 
-Live probes settled the `fetch` question; a Worker spike (`spike/tapo-tls-spike/`) tested the
-`node:tls` escape hatch in `workerd`:
+Live probes settled the `fetch` question; a throwaway Worker spike (since removed — it was
+deployed to the edge, tested, and torn down) tested the `node:tls` escape hatch in `workerd`:
 
 - **`fetch` → blocked (certain).** `openssl`/`curl` reject `n-wap.i.tplinkcloud.com` against
   the public store (`issuer = TP-Link Cloud Server CA`, `verify code 20`); `curl --cacert

@@ -12,22 +12,30 @@ permissions:
 jobs:
   typecheck:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: squid
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
-          node-version: 'latest'
+          node-version: 'lts/*'
           cache: npm
+          cache-dependency-path: squid/package-lock.json
       - run: npm ci
       - run: npm run typecheck
 
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: squid
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
-          node-version: 'latest'
+          node-version: 'lts/*'
           cache: npm
+          cache-dependency-path: squid/package-lock.json
       - run: npm ci
       - run: npm test

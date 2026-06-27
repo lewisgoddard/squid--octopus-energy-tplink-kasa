@@ -5,6 +5,13 @@ A [Cloudflare Worker](https://workers.cloudflare.com/) that proxies and caches O
 - **Worker name:** `kraken`
 - **D1 database name:** `kraken-db`
 
+### Repository layout
+
+| Path | What |
+|------|------|
+| `squid/` | The Squid Worker (this README's subject) — `index.js`, `wrangler.toml`, `test/`. **Run all `wrangler`/`npm` commands below from here (`cd squid`).** |
+| `relay/` | A CA-trusting passthrough Container for TP-Link's V2 (Tapo / Kasa-v2) cloud — needed because a Worker's `fetch` can't trust TP-Link's private CA. See `.claude/plans/TAPO_SMART_TRANSPORT.md`. |
+
 ## Contents
 
 - [Deployment](#deployment)
@@ -21,9 +28,10 @@ A [Cloudflare Worker](https://workers.cloudflare.com/) that proxies and caches O
 
 ## Deployment
 
-Deploy and manage this worker using the [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/):
+Deploy and manage this worker using the [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/), from the `squid/` directory:
 
 ```bash
+cd squid
 npx wrangler deploy
 ```
 
@@ -195,6 +203,7 @@ npx wrangler d1 execute kraken-db --local --command "CREATE TABLE IF NOT EXISTS 
 ### Running locally
 
 ```bash
+cd squid
 npm run dev
 ```
 

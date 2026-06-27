@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "description": "CA-trusting passthrough relay for the TP-Link V2 cloud (Tapo / Kasa v2).",
+  "engines": {
+    "node": ">=24"
+  },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"
   }

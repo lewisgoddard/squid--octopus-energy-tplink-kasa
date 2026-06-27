@@ -9,14 +9,40 @@ updates:
         update-types:
           - "minor"
           - "patch"
+
+  # The Squid Worker.
   - package-ecosystem: "npm"
-    directory: "/"
+    directory: "/squid"
     schedule:
       interval: "monthly"
     allow:
       - dependency-type: "all"
     groups:
       npm-patching:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # The TP-Link V2 cloud relay Worker.
+  - package-ecosystem: "npm"
+    directory: "/relay"
+    schedule:
+      interval: "monthly"
+    allow:
+      - dependency-type: "all"
+    groups:
+      npm-patching:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # The relay container base image (node:24-alpine).
+  - package-ecosystem: "docker"
+    directory: "/relay"
+    schedule:
+      interval: "monthly"
+    groups:
+      docker-patching:
         update-types:
           - "minor"
           - "patch"
