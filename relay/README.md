@@ -15,16 +15,17 @@ that: terminate TLS and forward.
 ## How it works
 
 ```
-Squid Worker ──(Container binding)──▶ worker.mjs ──▶ TapoRelay container ──▶ TP-Link V2 cloud
-  signs every request                 secret gate     forwarder.mjs (CA trust + allowlist)
+Squid Worker ──(service binding)──▶ worker.mjs ──(container binding)──▶ TapoRelay container ──▶ TP-Link V2 cloud
+  signs every request               routes to container                  forwarder.mjs (CA trust + allowlist)
 ```
 
 - **`forwarder.mjs`** — reads the target URL from `X-Forward-To`, checks the host allowlist
   (`*.tplinkcloud.com`, `*.tplinknbu.com`), forwards the request verbatim (method, headers
   incl. the caller's signed `X-Authorization`/`Content-MD5`, body) with `tplink-roots.pem`
   trusted, and streams the response back.
-- **`worker.mjs`** — entry Worker: gates on a shared secret (`RELAY_SECRET`) and routes to
-  the container.
+- **`worker.mjs`** — entry Worker: routes to the container. It has **no public URL**
+  (`workers_dev = false`) and is reachable only via the Squid Worker's **service binding**,
+  so the binding is the access control — no shared secret.
 - **`tplink-roots.pem`** — both TP-Link private roots (Tapo "Cloud Root CA"; Kasa/NBU
   "tp-link-CA") + intermediates.
 
@@ -38,26 +39,28 @@ Requires **Containers enabled** on the account (Workers Paid plan). Then:
 ```bash
 cd relay
 npm ci
-npx wrangler secret put RELAY_SECRET   # required — the Worker 401s until this is set
 npx wrangler deploy
 ```
 
-`RELAY_SECRET` is a **secret**, not a `[vars]` entry — secrets persist across deploys and
-aren't clobbered, so an automated (e.g. GitHub Actions) `wrangler deploy` keeps it intact.
-Never add it to `wrangler.toml`'s `[vars]`: that committed plaintext would override the
-secret on every deploy. (For local dev, put it in `relay/.dev.vars`.)
+No secret to set — the relay has no public URL (`workers_dev = false`) and is reached only
+via the Squid Worker's service binding. Wire that binding up by adding to `squid/wrangler.toml`
+(once this relay is deployed):
 
-Validate end-to-end (expect a real TP-Link JSON error, not a TLS failure):
-
-```bash
-curl -H "x-relay-secret: <secret>" \
-     -H "X-Forward-To: https://n-wap.i.tplinkcloud.com/api/v2/common/passthrough" \
-     https://tapo-relay.<subdomain>.workers.dev/
-# -> {"error_code":-10000,"msg":"405 ... Method Not Allowed"}
+```toml
+[[services]]
+binding = "RELAY"
+service = "tapo-relay"
 ```
 
-The forwarder logic + CA bundle are validated locally (it forwards to all three V2 hosts
-with real responses); only the Cloudflare Container deploy needs the account entitlement.
+Squid then calls it with `relayFetch(env.RELAY, targetUrl, …)` (boot-tolerant: timeout + one
+retry; see `squid/index.js`).
+
+**Validating:** since there's no public URL, you can't `curl` it directly. Either call it
+through Squid once integrated, or temporarily set `workers_dev = true` + add a secret gate for
+a one-off `curl` test (expect a real TP-Link JSON error, not a TLS failure):
+`{"error_code":-10000,"msg":"405 … Method Not Allowed"}`. The forwarder + CA bundle are
+already validated locally (forwards to all three V2 hosts with real responses); only the
+Cloudflare Container deploy needs the account entitlement.
 
 ## Scaling & placement
 

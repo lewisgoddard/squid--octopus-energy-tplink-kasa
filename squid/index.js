@@ -558,6 +558,54 @@ async function kasaSetColor(env, dev, colour) {
 }
 
 /**
+ * Calls the TP-Link V2 cloud relay (the service-bound `tapo-relay` Worker → its CA-trusting
+ * container) to make one HTTPS request to `targetUrl` — an absolute https URL on a TP-Link V2
+ * host. The relay is the only way to reach those hosts (a Worker's fetch can't trust their
+ * private CA). The container scales to zero, so a call after idle cold-starts it (~1–3s; the
+ * container helper waits up to ~20s for readiness) — so we apply `timeoutMs` and **one retry**
+ * (a retry lands on a now-warm instance) and throw cleanly on exhaustion rather than hanging.
+ * An upstream HTTP error (4xx/5xx) is a real response: returned, not retried.
+ *
+ * The relay reads the target from the `X-Forward-To` header (the request URL is ignored), and
+ * forwards the method/headers/body verbatim — so the caller (the future SMART transport) signs
+ * and builds the request; this only moves it through the relay.
+ * @param {Fetcher} relay - the RELAY service binding (`env.RELAY`).
+ * @param {string} targetUrl - absolute https URL on a TP-Link V2 host.
+ * @param {{ method?: string, headers?: Record<string, string>, body?: string }} [init]
+ * @param {{ timeoutMs?: number, retries?: number }} [opts]
+ * @returns {Promise<Response>}
+ */
+async function relayFetch(relay, targetUrl, init = {}, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 30_000 // > the container's ~20s port-ready window + a margin
+  const retries = opts.retries ?? 1
+  /** @type {unknown} */
+  let lastErr
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController()
+    let timer = 0
+    // Race the call against a timeout (which also aborts the underlying fetch), so a stuck
+    // cold-start can't hang us regardless of whether the callee observes the signal.
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => { controller.abort(); reject(new Error(`relay timeout after ${timeoutMs}ms`)) }, timeoutMs)
+    })
+    try {
+      const req = new Request("https://relay/", {
+        method: init.method ?? "GET",
+        headers: { ...init.headers, "X-Forward-To": targetUrl },
+        body: init.body,
+        signal: controller.signal,
+      })
+      return await Promise.race([relay.fetch(req), timeout])
+    } catch (err) {
+      lastErr = err
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  throw new Error(`relay request to ${targetUrl} failed after ${retries + 1} attempt(s): ${lastErr instanceof Error ? lastErr.message : lastErr}`)
+}
+
+/**
  * Sets a hub-connected TRV's target temperature (°C).
  *
  * NOT YET WIRED. KE100/KH100 speak the SMART/Tapo protocol — python-kasa sets the
@@ -2149,4 +2197,5 @@ export {
   setpointFor,
   aggregateDays,
   matchRoute,
+  relayFetch,
 }

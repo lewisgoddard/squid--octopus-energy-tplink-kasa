@@ -54,7 +54,13 @@
           + worker.mjs Container class + wrangler.toml). LOCALLY VALIDATED: forwards to all 3 V2
           hosts (Tapo/Kasa-v2/NBU) with real responses; allowlist/error cases pass. Image builds
           (amd64), Worker uploads, but `wrangler deploy` blocked at /containers/me → Unauthorized:
-          ACCOUNT needs Containers enabled (Workers Paid plan). Once enabled: cd relay && wrangler
-          deploy, then end-to-end test. Set a real RELAY_SECRET first.
-    - [ ] After relay deploys: build the Worker-side SMART transport (tapoToken + HMAC-SHA1 signing
-          + V2 passthrough via the relay) + refresh-token bootstrap; un-gate kasaSetTargetTemp.
+          ACCOUNT needs Containers enabled (Workers Paid plan). Topology = option #2: separate
+          worker, workers_dev=false (NO public URL), NO secret — Squid reaches it via a service
+          binding. Once Containers enabled: cd relay && wrangler deploy.
+    - [x] relayFetch built (squid/index.js + test/relay.test.js): boot-tolerant relay client
+          (env.RELAY.fetch + X-Forward-To, timeout 30s + 1 retry, returns HTTP errors). The
+          kraken-side [[services]] binding is DEFERRED to integration (don't add to live
+          squid/wrangler.toml until tapo-relay is deployed, or it breaks kraken's deploy).
+    - [ ] After relay deploys: add the service binding; build the rest of the SMART transport
+          (tapoToken + signV2 HMAC-SHA1 + smartCall via relayFetch) + refresh-token bootstrap;
+          un-gate kasaSetTargetTemp.

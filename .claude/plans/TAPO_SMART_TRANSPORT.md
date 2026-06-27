@@ -110,17 +110,26 @@ local control) is required.**
 
 ## Revised architecture (if the TLS spike passes)
 
-Much smaller than the original crypto-heavy plan:
+Much smaller than the original crypto-heavy plan.
 
+**Relay topology — chosen: option #2 (separate, service-bound, no public URL).** The relay
+stays its own Worker (`tapo-relay`) with `workers_dev = false` and **no `RELAY_SECRET`** —
+Squid reaches it via a **service binding** (`env.RELAY`), which is the access control. (Option
+#1, embedding the container in kraken, was rejected: it would couple a Docker build + the
+Containers entitlement into every kraken deploy.) The kraken-side `[[services]]` binding is the
+one piece deferred to integration — adding it before `tapo-relay` is deployed could break
+kraken's live deploys.
+
+- `relayFetch(relay, targetUrl, init, opts)` — ✅ **built + tested** (`squid/index.js`,
+  `test/relay.test.js`). Boot-tolerant relay client: `env.RELAY.fetch` with the target in
+  `X-Forward-To`, `timeout` (default 30s, > the container's ~20s port-ready window) + **one
+  retry**; returns upstream HTTP errors (doesn't retry them), throws cleanly on exhaustion.
 - `tapoToken(env)` — V2 login to the Tapo host, cache token+refresh (new `tapo_tokens` row).
 - `signV2(bodyJson, path)` — Content-MD5 + X-Authorization (md5 + HMAC-SHA1, `node:crypto`).
-- `smartCall(env, dev, method, params, childId?)` — signed `POST /api/v2/common/passthrough`
-  with `requestData = {method, params}` (wrap a hub child in `control_child`), sent through
-  the relay binding. **Must be boot-tolerant:** the relay scales to zero, so a call often
-  cold-starts the container (~1–3s; the helper waits, up to ~20s port-ready). Give the relay
-  call a timeout + **one retry** (the retry lands on a now-warm instance) and surface a clean
-  skip on failure rather than hanging — the evaluate cron and manual control both tolerate
-  the few-second first-call latency.
+- `smartCall(env, dev, method, params, childId?)` — builds + signs the `POST /api/v2/common/
+  passthrough` (`requestData = {method, params}`, wrap a hub child in `control_child`) and sends
+  it via `relayFetch(env.RELAY, …)`. The evaluate cron and manual control both tolerate the
+  few-second first-call (cold-start) latency.
 - `kasaSetTargetTemp` (currently throws) → `smartCall("set_device_info", {target_temp})`.
 - **Transport selection:** tag each snapshot device `proto: "iot" | "smart"`; route reads/
   writes accordingly. Rule engine, `resolveTarget`/`hubOf`, snapshot, endpoints stay
