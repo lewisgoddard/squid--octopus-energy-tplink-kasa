@@ -39,3 +39,19 @@ jobs:
           cache-dependency-path: squid/package-lock.json
       - run: npm ci
       - run: npm test
+
+  relay:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+      - run: node --check forwarder.mjs
+      - run: node --check worker.mjs
