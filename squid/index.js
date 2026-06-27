@@ -1025,6 +1025,24 @@ async function ruleDesired(env, rule, rate, nowISO) {
 }
 
 /**
+ * any-on reducer: a load tagged to several on/off rules is ON if ANY of them wants it on.
+ * Drops null results (rules that couldn't be evaluated) and collects the rest's reasons; an
+ * empty `reasons` means nothing evaluable applied (the caller then skips the load).
+ * @param {({ on: boolean, reason: string } | null)[]} results - one per rule, from {@link ruleDesired}.
+ * @returns {{ desired: boolean, reasons: string[] }}
+ */
+function anyOn(results) {
+  let desired = false
+  const reasons = []
+  for (const d of results) {
+    if (d == null) continue
+    if (d.on) desired = true
+    reasons.push(d.reason)
+  }
+  return { desired, reasons }
+}
+
+/**
  * Evaluates enabled rules against the current rate and switches each tagged
  * load. A "load" is a whole device or a single power-strip outlet (the tagged id
  * is a deviceId or an outlet id); a load may be tagged to multiple rules and is
@@ -1091,14 +1109,9 @@ async function evaluateDevices(env) {
     if (!rate) { actions.push({ device_id: targetId, alias, skipped: "no rate data" }); continue }
 
     // any-on: ON if any applicable rule wants it on.
-    let desired = false
-    const reasons = []
-    for (const rule of deviceRules) {
-      const d = await ruleDesired(env, rule, rate, nowISO)
-      if (d == null) continue
-      if (d.on) desired = true
-      reasons.push(d.reason)
-    }
+    const desiredList = []
+    for (const rule of deviceRules) desiredList.push(await ruleDesired(env, rule, rate, nowISO))
+    const { desired, reasons } = anyOn(desiredList)
     if (!reasons.length) { actions.push({ device_id: targetId, alias, skipped: "no evaluable rules" }); continue }
     const reason = `${desired ? "ON" : "OFF"} [any-on] ${reasons.join("; ")}`
 
@@ -2391,6 +2404,8 @@ export {
   validateRuleBody,
   ruleTargetError,
   ruleDesired,
+  anyOn,
+  computeSquidForecast,
   setpointFor,
   aggregateDays,
   matchRoute,
