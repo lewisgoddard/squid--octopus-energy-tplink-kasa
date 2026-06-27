@@ -1,5 +1,9 @@
 # Squid — Octopus Energy × TP-Link Kasa
 
+[![CI](https://github.com/lewisgoddard/squid--octopus-energy-tplink-kasa/actions/workflows/ci.yml/badge.svg)](https://github.com/lewisgoddard/squid--octopus-energy-tplink-kasa/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/lewisgoddard/squid--octopus-energy-tplink-kasa/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/lewisgoddard/squid--octopus-energy-tplink-kasa/actions/workflows/github-code-scanning/codeql)
+[![Dependabot Updates](https://github.com/lewisgoddard/squid--octopus-energy-tplink-kasa/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/lewisgoddard/squid--octopus-energy-tplink-kasa/actions/workflows/dependabot/dependabot-updates)
+
 Make TP-Link Kasa devices rate-aware: Squid reads your Octopus Energy (Agile) rates and
 switches loads — and shows price status on bulbs — when electricity is cheap.
 
