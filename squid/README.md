@@ -226,6 +226,19 @@ The worker will be available at `http://localhost:8787`. Wrangler will use `.dev
 curl "http://localhost:8787/cdn-cgi/handler/scheduled"
 ```
 
+### Smoke test
+
+```bash
+./smoke.sh
+```
+
+Boots `wrangler dev` against the local D1 and checks the no-device endpoints (forecast, rules,
+log, rates) boot, route, authenticate and read D1 — then tears `wrangler dev` back down. It
+deliberately avoids the TP-Link/Octopus cloud (no `kasa/*`, `/evaluate`, `/rates/refresh`). This
+complements `npm test`: the unit tests cover the logic offline, the smoke covers the *wiring* the
+unit tests can't — workerd + `nodejs_compat`/`node:crypto`, the route table, the auth gate and the
+D1 binding. Needs `.dev.vars`.
+
 ## Usage
 
 ### Endpoints
